@@ -1,14 +1,14 @@
 """
-Visualization Agent — generates a production-grade Plotly chart gallery.
+Visualization Agent - generates a production-grade Plotly chart gallery.
 
 Chart suite (auto-selected based on data shape):
-  1. data_quality        — missing value bar chart (always generated)
-  2. distributions       — histogram grid for all numeric columns
-  3. correlation_heatmap — Pearson correlation matrix (≥2 numeric cols)
-  4. target_analysis     — class balance + box plots (binary/categorical target)
-  5. scatter_matrix      — pair plot coloured by target (≥50 rows)
-  6. feature_importance  — bar chart from feature_importance.csv if present
-  7. roc_curve           — Logistic Regression baseline ROC (binary target, sklearn)
+  1. data_quality        - missing value bar chart (always generated)
+  2. distributions       - histogram grid for all numeric columns
+  3. correlation_heatmap - Pearson correlation matrix (>=2 numeric cols)
+  4. target_analysis     - class balance + box plots (binary/categorical target)
+  5. scatter_matrix      - pair plot coloured by target (>=50 rows)
+  6. feature_importance  - bar chart from feature_importance.csv if present
+  7. roc_curve           - Logistic Regression baseline ROC (binary target, sklearn)
 
 Each chart:
   - Saved as .html (self-contained Plotly interactive file)
@@ -20,7 +20,7 @@ Message bus integration:
   - Publishes VIZ_COMPLETE at the end with chart_count in payload
 
 Graceful degradation:
-  - _PLOTLY_AVAILABLE flag — if plotly isn't installed, generate() returns
+  - _PLOTLY_AVAILABLE flag - if plotly isn't installed, generate() returns
     an empty manifest without raising.
   - All individual chart methods are wrapped in try/except so one failing
     chart never aborts the entire gallery.
@@ -41,7 +41,7 @@ from multimodal_ds.config import OUTPUT_DIR, REVIEWER_MODEL, OLLAMA_BASE_URL, LL
 
 logger = logging.getLogger(__name__)
 
-# ── Plotly availability flag ───────────────────────────────────────────────
+# -- Plotly availability flag -----------------------------------------------
 # Patched to False in tests that verify graceful degradation.
 try:
     import plotly.express as px
@@ -49,7 +49,7 @@ try:
     _PLOTLY_AVAILABLE = True
 except ImportError:
     _PLOTLY_AVAILABLE = False
-    logger.warning("[VizAgent] plotly not installed — visualization disabled")
+    logger.warning("[VizAgent] plotly not installed - visualization disabled")
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -127,6 +127,11 @@ class VisualizationAgent:
         base = Path(working_dir) if working_dir else Path(OUTPUT_DIR)
         self.working_dir = base / session_id
         self.working_dir.mkdir(parents=True, exist_ok=True)
+        self._tuning_results: dict = {}
+
+    def set_tuning_results(self, tuning_results: dict) -> None:
+        """Store Optuna tuning results for chart generation."""
+        self._tuning_results = tuning_results if tuning_results else {}
 
     def _publish_viz_request(self) -> None:
         """Publish VIZ_REQUEST to signal that visualization has started."""
@@ -143,7 +148,7 @@ class VisualizationAgent:
             logger.debug(f"[VizAgent] Bus publish VIZ_REQUEST failed: {e}")
 
 
-    # ── Main entry point ───────────────────────────────────────────────────
+    # -- Main entry point ---------------------------------------------------
 
     def generate(
         self,
@@ -162,7 +167,7 @@ class VisualizationAgent:
         """
         manifest = ChartManifest(session_id=self.session_id)
 
-        # ── Bus: VIZ_REQUEST ───────────────────────────────────────────────
+        # -- Bus: VIZ_REQUEST -----------------------------------------------
         self._publish_viz_request()
 
         if not _PLOTLY_AVAILABLE:
@@ -177,50 +182,48 @@ class VisualizationAgent:
 
         logger.info(
             f"[VizAgent] Generating chart gallery for session {self.session_id} "
-            f"— df shape {df.shape}, target={target_col!r}"
+            f"- df shape {df.shape}, target={target_col!r}"
         )
 
         numeric_cols = list(df.select_dtypes(include=["number"]).columns)
 
-        # ── Chart 1: Data quality / missing values (always) ────────────────
+        # -- Chart 1: Data quality / missing values (always) ----------------
         self._chart_missing_values(df, manifest)
 
-        # ── Chart 2: Feature distributions ────────────────────────────────
+        # -- Chart 2: Feature distributions --------------------------------
         if numeric_cols:
             self._chart_distributions(df, numeric_cols, target_col, manifest)
 
-        # ── Chart 3: Correlation heatmap ───────────────────────────────────
+        # -- Chart 3: Correlation heatmap ----------------------------------
         if len(numeric_cols) >= 2:
             self._chart_correlation_heatmap(df, numeric_cols, manifest)
 
-        # ── Chart 4: Target analysis ───────────────────────────────────────
+        # -- Chart 4: Target analysis --------------------------------------
         if target_col and target_col in df.columns:
             self._chart_target_analysis(df, target_col, numeric_cols, manifest)
 
-        # ── Chart 5: Scatter matrix (larger datasets only) ─────────────────
+        # -- Chart 5: Scatter matrix (larger datasets only) ----------------
         if len(df) >= 50 and len(numeric_cols) >= 2:
             self._chart_scatter_matrix(df, numeric_cols, target_col, manifest)
 
-        # ── Chart 6: Feature importance (if artifact exists) ───────────────
+        # -- Chart 6: Feature importance (if artifact exists) --------------
         fi = self._find_feature_importance()
         if fi:
             self._chart_feature_importance(fi, manifest)
 
-        # ── Chart 7: ROC curve (binary target, sklearn required) ───────────
+        # -- Chart 7: ROC curve (binary target, sklearn required) ----------
         if target_col and target_col in df.columns:
             self._chart_roc_curve(df, target_col, numeric_cols, manifest)
 
         # Optuna results chart (if tuning was run)
-        tuning_results = getattr(self, "_tuning_results", None)
-        if tuning_results and tuning_results.get("best_overall_model"):
-            self._chart_optuna_results(tuning_results, manifest)
+        self._chart_optuna_results(manifest)
 
         # Save manifest JSON
         manifest.save(self.working_dir)
         self._publish_viz_complete(manifest)
 
         logger.info(
-            f"[VizAgent] Gallery complete — {len(manifest.charts)} charts "
+            f"[VizAgent] Gallery complete - {len(manifest.charts)} charts "
             f"saved to {self.working_dir}"
         )
         return manifest
@@ -377,7 +380,7 @@ class VisualizationAgent:
             fig = px.histogram(
                 df,
                 x=target_col,
-                title=f"Target Distribution — {target_col}",
+                title=f"Target Distribution - {target_col}",
                 color=target_col if n_unique <= 10 else None,
             )
             filename = "target_analysis.html"
@@ -546,7 +549,7 @@ class VisualizationAgent:
                 name="Random",
             ))
             fig.update_layout(
-                title=f"ROC Curve — Logistic Regression Baseline (AUC={auc:.3f})",
+                title=f"ROC Curve - Logistic Regression Baseline (AUC={auc:.3f})",
                 xaxis_title="False Positive Rate",
                 yaxis_title="True Positive Rate",
             )
@@ -556,13 +559,13 @@ class VisualizationAgent:
 
             narrative = (
                 f"Logistic Regression baseline ROC curve for target '{target_col}'. "
-                f"AUC = {auc:.3f} — "
+                f"AUC = {auc:.3f} - "
                 + (
                     "strong discriminative power."
                     if auc >= 0.8
-                    else "moderate discriminative power — consider non-linear models."
+                    else "moderate discriminative power - consider non-linear models."
                     if auc >= 0.6
-                    else "weak discriminative power — further feature engineering needed."
+                    else "weak discriminative power - further feature engineering needed."
                 )
             )
             manifest.add("roc_curve", filename, "ROC Curve (Baseline)", narrative, df.shape)
@@ -578,7 +581,7 @@ class VisualizationAgent:
         """Save a Plotly figure as a self-contained HTML file."""
         path = self.working_dir / filename
         fig.write_html(str(path), include_plotlyjs="cdn", full_html=True)
-        logger.debug(f"[VizAgent] Saved chart → {path}")
+        logger.debug(f"[VizAgent] Saved chart to {path}")
         return path
 
     def _find_feature_importance(self) -> Dict[str, float]:
@@ -649,17 +652,43 @@ class VisualizationAgent:
 
     # ── Message bus integration ────────────────────────────────────────────
 
-    def _chart_optuna_results(self, tuning_results: dict, manifest: ChartManifest) -> None:
+    def _chart_optuna_results(self, manifest: ChartManifest) -> None:
         """Generate Optuna optimization history and parameter importance charts."""
+        if not self._tuning_results:
+            return
+
         try:
             import optuna
             import optuna.importance as oim
+            from plotly.subplots import make_subplots
 
+            tuning_results = self._tuning_results
             best_model = tuning_results.get("best_overall_model")
             best_score = tuning_results.get("best_overall_score")
 
-            # ------- Optimization History -------
-            fig_hist = go.Figure()
+            # Determine if we have parameter importance to show
+            has_importance = False
+            importances = {}
+            if best_model:
+                best_res = tuning_results.get(best_model, {})
+                study = best_res.get("study")
+                if study:
+                    try:
+                        importances = oim.get_param_importances(study)
+                        if importances:
+                            has_importance = True
+                    except Exception:
+                        pass
+
+            # Combine plots into subplots
+            rows = 2 if has_importance else 1
+            fig = make_subplots(
+                rows=rows, cols=1,
+                subplot_titles=("Optimization History", f"Parameter Importance - {best_model}" if has_importance else ""),
+                vertical_spacing=0.15
+            )
+
+            # 1. Optimization History
             max_trial = 0
             for model_name, result in tuning_results.items():
                 if model_name in {"best_overall_model", "best_overall_score"}:
@@ -673,71 +702,35 @@ class VisualizationAgent:
                 if not xs:
                     continue
                 max_trial = max(max_trial, max(xs))
-                fig_hist.add_trace(go.Scatter(x=xs, y=ys, mode="lines+markers", name=model_name))
+                fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines+markers", name=model_name), row=1, col=1)
 
-            # Horizontal dashed line for best overall score
             if max_trial > 0 and best_score is not None:
-                fig_hist.add_hline(y=best_score, line_dash="dash", annotation_text=f"Best Score: {best_score:.4f}", annotation_position="top left")
+                fig.add_hline(y=best_score, line_dash="dash", annotation_text=f"Best Overall: {best_score:.4f}", row=1, col=1)
 
-            fig_hist.update_layout(
-                title="Optuna Hyperparameter Optimization History",
-                xaxis_title="Trial",
-                yaxis_title="Score",
-                legend_title="Model",
-            )
-            hist_file = "optuna_history.html"
-            self._save_chart(fig_hist, hist_file)
-            narrative_hist = self._get_narrative(
-                "Optuna optimization history for hyperparameter tuning",
-                None,
-                fallback="Optimization history shows how scores evolve across trials for each model.",
-            )
-            manifest.add("optuna_history", hist_file, "Optuna Optimization History", narrative_hist, (0, 0))
+            # 2. Parameter Importance
+            if has_importance:
+                sorted_imp = sorted(importances.items(), key=lambda kv: kv[1])
+                params, vals = zip(*sorted_imp)
+                fig.add_trace(go.Bar(x=vals, y=params, orientation='h', name="Importance"), row=2, col=1)
 
-            # ------- Parameter Importance (best model) -------
-            if best_model:
-                best_res = tuning_results.get(best_model, {})
-                study = best_res.get("study")
-                if study:
-                    try:
-                        importances = oim.get_param_importances(study)
-                    except Exception:
-                        importances = {}
-                    if importances:
-                        fig_imp = go.Figure()
-                        sorted_imp = sorted(importances.items(), key=lambda kv: kv[1])
-                        params, vals = zip(*sorted_imp)
-                        fig_imp.add_trace(go.Bar(x=vals, y=params, orientation='h'))
-                        fig_imp.update_layout(
-                            title=f"Parameter Importance — {best_model}",
-                            xaxis_title="Importance",
-                            yaxis_title="Parameter",
-                        )
-                        imp_file = "optuna_param_importance.html"
-                        self._save_chart(fig_imp, imp_file)
-                        narrative_imp = self._get_narrative(
-                            f"Optuna parameter importance for the best model {best_model}",
-                            None,
-                            fallback=f"Parameter importance chart highlights which hyperparameters most affect performance for {best_model}.",
-                        )
-                        manifest.add("optuna_param_importance", imp_file, f"Parameter Importance — {best_model}", narrative_imp, (0, 0))
+            fig.update_layout(
+                height=450 * rows,
+                title_text="Model Selection - Optuna Tuning Results",
+                showlegend=True
+            )
+
+            res_file = "optuna_results.html"
+            self._save_chart(fig, res_file)
+            
+            narrative = self._get_narrative(
+                "Optuna hyperparameter tuning results",
+                pd.DataFrame(),
+                fallback=f"Tuning results for {best_model if best_model else 'models'} show optimization history and parameter importance."
+            )
+            manifest.add("optuna_results", res_file, "Optuna Tuning Results", narrative, (0, 0))
+
         except Exception as e:
             logger.error(f"[VizAgent] Optuna result charts failed: {e}")
-        """Store tuning results for later chart generation."""
-        self._tuning_results = tuning_results
-
-        """Publish VIZ_REQUEST to signal that visualization has started."""
-        try:
-            from multimodal_ds.core.message_bus import AgentMessage, MessageType, get_bus
-            bus = get_bus()
-            bus.publish(AgentMessage(
-                msg_type=MessageType.VIZ_REQUEST,
-                payload={"session_id": self.session_id},
-                sender="visualization_agent",
-                session_id=self.session_id,
-            ))
-        except Exception as e:
-            logger.debug(f"[VizAgent] Bus publish VIZ_REQUEST failed: {e}")
 
     def _publish_viz_complete(self, manifest: ChartManifest) -> None:
         """Publish VIZ_COMPLETE with chart count after gallery is built."""

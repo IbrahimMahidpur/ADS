@@ -81,6 +81,20 @@ def ingest(
     console.print(table)
 
 
+ACCUMULATING_FIELDS = {
+    "code_outputs", "full_code_outputs", "errors", "visualizations",
+    "saved_artifacts", "audio_transcripts", "image_embeddings",
+    "tabular_summaries", "parsed_documents",
+}
+
+def _merge_state(base: dict, update: dict) -> dict:
+    for k, v in update.items():
+        if k in ACCUMULATING_FIELDS and isinstance(v, list):
+            base[k] = base.get(k, []) + v
+        else:
+            base[k] = v
+    return base
+
 @app.command()
 def run(
     files: list[Path] = typer.Argument(..., help="One or more files to analyse"),
@@ -125,7 +139,7 @@ def run(
             for event in graph.stream(initial_state, config=config, stream_mode="updates"):
                 for node_name, state_update in event.items():
                     console.print(f"[blue]» Finished node:[/] [bold]{node_name}[/]")
-                    final_state.update(state_update)
+                    final_state = _merge_state(final_state, state_update)
                     
                     # Provide specific updates based on node
                     if node_name == "planner":

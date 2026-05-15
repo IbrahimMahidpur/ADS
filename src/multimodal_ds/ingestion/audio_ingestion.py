@@ -1,5 +1,5 @@
 """
-Audio Ingestion — uses local OpenAI Whisper (runs on CPU/GPU, no API key).
+Audio Ingestion - uses local OpenAI Whisper (runs on CPU/GPU, no API key).
 Produces diarized transcript with entity extraction.
 """
 import logging
@@ -52,7 +52,7 @@ def ingest_audio(file_path: str, model_size: str = "base") -> UnifiedDocument:
             start = _format_time(seg["start"])
             end = _format_time(seg["end"])
             text = seg["text"].strip()
-            transcript_lines.append(f"[{start} → {end}] {text}")
+            transcript_lines.append(f"[{start} -> {end}] {text}")
 
         doc.text_content = "\n".join(transcript_lines)
         doc.metadata["language"] = result.get("language", "unknown")
@@ -65,7 +65,7 @@ def ingest_audio(file_path: str, model_size: str = "base") -> UnifiedDocument:
         doc.metadata["entities"] = entities
 
         # ------------------------------------------------------------
-        # Speaker Diarization (optional – uses pyannote.audio if available)
+        # Speaker Diarization (optional - uses pyannote.audio if available)
         # ------------------------------------------------------------
         speaker_transcript = {}
         try:
@@ -87,7 +87,7 @@ def ingest_audio(file_path: str, model_size: str = "base") -> UnifiedDocument:
         except Exception as e:
             logger.warning(f"[Audio] Diarization unavailable or failed: {e}")
 
-        # Store speaker‑wise transcript (concatenated)
+        # Store speaker-wise transcript (concatenated)
         if speaker_transcript:
             doc.metadata["speaker_transcript"] = {k: " ".join(v) for k, v in speaker_transcript.items()}
 

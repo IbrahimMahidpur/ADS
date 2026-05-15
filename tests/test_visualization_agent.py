@@ -240,3 +240,9 @@ class TestEdgeCases:
         df = pd.DataFrame({"a": [1, 2], "b": [3, 4]})
         manifest = agent.generate(df=df)
         assert len(manifest.charts) == 0
+
+    def test_set_tuning_results_storage(self, tmp_agent):
+        """Verify that tuning results are correctly stored for chart generation."""
+        tuning_data = {"best_overall_model": "XGBoost", "best_overall_score": 0.95}
+        tmp_agent.set_tuning_results(tuning_data)
+        assert tmp_agent._tuning_results == tuning_data

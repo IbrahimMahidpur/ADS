@@ -1,12 +1,12 @@
 """
-Image Ingestion — CLIP embeddings + LLaVA description via local Ollama.
+Image Ingestion - CLIP embeddings + LLaVA description via local Ollama.
 No external APIs needed.
 
 Offline-first design:
   - CLIP is attempted only if transformers + torch are already installed
     AND the model is already cached locally.
   - If the model is not cached (or HuggingFace is unreachable), CLIP is
-    skipped silently — LLaVA description still runs via Ollama.
+    skipped silently - LLaVA description still runs via Ollama.
   - Set env var MMADS_SKIP_CLIP=1 to always skip CLIP (useful in CI or
     air-gapped environments).
   - To pre-cache the model once: python -c "from transformers import
@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 
 SUPPORTED_IMAGES = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".webp"}
 
-# Respect explicit skip flag — useful for CI / air-gapped machines
+# Respect explicit skip flag - useful for CI / air-gapped machines
 _SKIP_CLIP = os.getenv("MMADS_SKIP_CLIP", "0").strip() == "1"
 
 
@@ -58,7 +58,7 @@ def ingest_image(file_path: str) -> UnifiedDocument:
         doc.metadata["mode"] = img.mode
         doc.metadata["format"] = img.format
 
-        # Step 1: CLIP embeddings — offline only, never blocks
+        # Step 1: CLIP embeddings - offline only, never blocks
         if not _SKIP_CLIP:
             embeddings = _get_clip_embeddings_offline(img)
             if embeddings is not None:
@@ -92,7 +92,7 @@ def ingest_image(file_path: str) -> UnifiedDocument:
 def _get_clip_embeddings_offline(img) -> Optional[list[float]]:
     """
     Generate CLIP embeddings using locally cached model only.
-    Never triggers a network download — returns None immediately if:
+    Never triggers a network download - returns None immediately if:
       - transformers / torch not installed
       - model not present in HuggingFace cache
       - any other error
@@ -109,18 +109,18 @@ def _get_clip_embeddings_offline(img) -> Optional[list[float]]:
 
         model_name = "openai/clip-vit-base-patch32"
 
-        # Check if config is cached — if not, skip without downloading
+        # Check if config is cached - if not, skip without downloading
         try:
             cached_file(
                 model_name,
                 "config.json",
-                local_files_only=True,   # ← KEY: never go to network
+                local_files_only=True,   # <- KEY: never go to network
             )
         except Exception:
-            logger.debug("[CLIP] Model not in local cache — skipping embeddings")
+            logger.debug("[CLIP] Model not in local cache - skipping embeddings")
             return None
 
-        # Model is cached — safe to load
+        # Model is cached - safe to load
         model = CLIPModel.from_pretrained(model_name, local_files_only=True)
         processor = CLIPProcessor.from_pretrained(model_name, local_files_only=True)
 
@@ -166,4 +166,4 @@ def _describe_with_llava(file_path: str) -> str:
 
     except Exception as e:
         logger.warning(f"[LLaVA] Description failed: {e}")
-        return f"[Image: {Path(file_path).name}] — Vision description unavailable"
+        return f"[Image: {Path(file_path).name}] - Vision description unavailable"

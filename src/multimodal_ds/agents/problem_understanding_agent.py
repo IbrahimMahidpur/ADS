@@ -10,7 +10,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import List, Literal
+from typing import Any, List, Literal
 
 from multimodal_ds.config import PLANNER_MODEL, OLLAMA_BASE_URL, LLM_TIMEOUT
 from multimodal_ds.core.schema import UnifiedDocument, DataType
@@ -161,8 +161,8 @@ class ProblemUnderstandingAgent:
         """
         # Try LLM first
         try:
-            doc_types = [doc.data_type.value for doc in documents]
-            doc_summary = ", ".join(doc_types) if doc_types else "none"
+            doc_types = self._get_doc_types(documents)
+            doc_summary = ", ".join([dt.value for dt in doc_types]) if doc_types else "none"
             prompt = (
                 "You are a senior data scientist tasked with formalising a user request."
                 " Provide a JSON object with the following fields: task_type, objective, constraints,"
@@ -224,10 +224,10 @@ class ProblemUnderstandingAgent:
 
         # Infer required deliverables from document data types
         deliverables: List[str] = []
-        data_types = {doc.data_type for doc in documents}
+        data_types = set(self._get_doc_types(documents))
         if DataType.TABULAR in data_types:
             deliverables.extend(["trained model", "feature importance chart"])
-        if DataType.TEXT in data_types:
+        if DataType.TEXT in data_types or DataType.PDF in data_types:
             deliverables.append("executive report")
         if DataType.IMAGE in data_types:
             deliverables.append("visualization chart")
@@ -246,3 +246,24 @@ class ProblemUnderstandingAgent:
         self.logger.info("[ProblemUnderstanding] Heuristic spec: %s (confidence %.2f)", spec.task_type, spec.confidence)
         return spec
 
+    def _get_doc_types(self, documents: List[Any]) -> List[DataType]:
+        """Helper to extract or infer DataType from documents (objects or strings)."""
+        types = []
+        for doc in (documents or []):
+            if hasattr(doc, "data_type") and isinstance(doc.data_type, DataType):
+                types.append(doc.data_type)
+            elif isinstance(doc, str):
+                ext = doc.split('.')[-1].lower()
+                if ext in ['csv', 'parquet', 'xlsx']:
+                    types.append(DataType.TABULAR)
+                elif ext == 'pdf':
+                    types.append(DataType.PDF)
+                elif ext in ['png', 'jpg', 'jpeg']:
+                    types.append(DataType.IMAGE)
+                elif ext in ['mp3', 'wav', 'm4a']:
+                    types.append(DataType.AUDIO)
+                elif ext in ['txt', 'docx', 'md']:
+                    types.append(DataType.TEXT)
+                else:
+                    types.append(DataType.UNKNOWN)
+        return types

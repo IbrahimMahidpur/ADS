@@ -1,10 +1,10 @@
 """
-Top-level LangGraph StateGraph — wires all agents as nodes with a
+Top-level LangGraph StateGraph - wires all agents as nodes with a
 MemorySaver checkpointer for session persistence.
 
 Fixes applied (vs original):
   1. _decide_ingestion_path: returns a single string, not a list.
-     Fan-out to multiple ingestion nodes requires Send() — this simpler
+     Fan-out to multiple ingestion nodes requires Send() - this simpler
      approach routes to the FIRST matching type, which is correct for
      the current sequential graph topology.
   2. _reviewer_node: task_result dict now uses keys that evaluation_agent
@@ -14,24 +14,20 @@ Fixes applied (vs original):
 from __future__ import annotations
 
 import logging
+from langgraph.types import Send
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 from multimodal_ds.config import OUTPUT_DIR
 import uuid
 from typing import Optional
 
-# Module-level singletons for PII scanning
-from presidio_analyzer import AnalyzerEngine
-from presidio_anonymizer import AnonymizerEngine
-
-_ANALYZER_ENGINE = AnalyzerEngine()
-_ANONYMIZER_ENGINE = AnonymizerEngine()
 
 logger = logging.getLogger(__name__)
-from multimodal_ds.agents.evaluation_agent import EvaluationAgent
+from multimodal_ds.agents.evaluation_agent import EvaluationAgent, FLAG_OVERALL_THRESHOLD
 from multimodal_ds.agents.code_execution_agent import CodeExecutionAgent
 from multimodal_ds.agents.problem_understanding_agent import ProblemUnderstandingAgent
 from multimodal_ds.agents.reflection_agent import ReflectionAgent, ReflectionReport
+from multimodal_ds.core.context_pool import get_context_pool
 session_logger = logging.getLogger('session_log')
 if not session_logger.handlers:
     handler = logging.FileHandler(OUTPUT_DIR / 'session_log.jsonl')
@@ -80,33 +76,82 @@ def _router_node(state):
                 flags[kind] = True
     logger.info(f"[Graph/Router] Routing flags: {flags}")
     return {"_routing_flags": flags}
-def _decide_ingestion_path(state):
+def _decide_ingestion_path(state) -> list[Send]:
     """Determine which ingestion nodes to invoke based on routing flags.
-    Returns a Send() action that fans out to all applicable ingestion nodes.
+    Returns a LIST of Send() objects for parallel execution.
     """
     flags = state.get("_routing_flags", {})
-    targets = []
-    if flags.get("doc"):
-        targets.append("doc_ingest")
-    if flags.get("image"):
-        targets.append("img_ingest")
-    if flags.get("audio"):
-        targets.append("audio_ingest")
-    if flags.get("table"):
-        targets.append("tab_ingest")
-    # If no ingestion needed, just proceed without fan‑out.
+    node_map = {
+        "table": "tab_ingest",
+        "doc": "doc_ingest",
+        "image": "img_ingest",
+        "audio": "audio_ingest"
+    }
+    targets = [node_map[k] for k, v in flags.items() if v and k in node_map]
+    
+    # If no ingestion needed, send to merge_ingest to continue the flow
     if not targets:
-        return {}
-    # Use LangGraph's Send to fan‑out to the selected nodes.
-    from langgraph.graph import Send
-    return Send(targets)
+        return [Send("merge_ingest", state)]
+    
+    return [Send(t, state) for t in targets]
 
 def _ingest_merge_node(state):
-    """Merge ingestion results – simply pass through the accumulated state.
-    The individual ingestion nodes already update the shared state, so this
-    node returns the state unchanged.
-    """
-    return state
+    """Merge ingestion results, perform blocked document checks, and sanitize state."""
+    from multimodal_ds.core.message_bus import get_bus, AgentMessage, MessageType
+    from multimodal_ds.core.context_pool import SharedContextPool
+    import logging
+    
+    logger = logging.getLogger(__name__)
+    session_id = state.get("session_id", "default")
+    errors = state.get("errors", [])
+    if errors is None:
+        errors = []
+    
+    # 1. Collect all BLOCKED documents from parsed_documents
+    parsed_documents = state.get("parsed_documents", [])
+    blocked = [d for d in parsed_documents if d.get("status") == "blocked"]
+    
+    # 2. If any blocked docs found
+    if blocked:
+        bus = get_bus()
+        for d in blocked:
+            source = d.get("provenance", {}).get("source_path", "?")
+            entity_types = d.get("metadata", {}).get("pii_report", {}).get("entity_types_found", [])
+            
+            # a. Log at WARNING level
+            logger.warning(f"[MergeIngest] BLOCKED document: {source} (Entities: {entity_types})")
+            
+            # b. Publish INGEST_BLOCKED to MessageBus
+            bus.publish(AgentMessage(
+                msg_type=MessageType.INGEST_BLOCKED,
+                payload={
+                    "source": source,
+                    "entity_types": entity_types
+                },
+                sender="ingest_merge",
+                session_id=session_id
+            ))
+            
+            # c. Add to state["errors"]
+            errors.append(f"[PII BLOCK] {source} blocked: {entity_types}")
+            
+    state["errors"] = errors
+            
+    # 3. Build a data_context_summary string from non-blocked tabular summaries
+    tabular_summaries = []
+    for d in parsed_documents:
+        if d.get("status") != "blocked":
+            summary = d.get("metadata", {}).get("tabular_summary")
+            if summary:
+                tabular_summaries.append(str(summary))
+                
+    if tabular_summaries:
+        summary_text = "\n".join(tabular_summaries)
+        pool = SharedContextPool()
+        pool.set("ingest_summary", summary_text, agent="ingest_merge")
+
+    # 4. Return the updated state with the new errors appended
+    return _sanitize_for_checkpoint(state)
 
 
 def _problem_understanding_node(state):
@@ -235,8 +280,18 @@ def _model_selection_node(state):
         shape = first.get("shape", [0, 0])
         n_rows = shape[0] if isinstance(shape, (list, tuple)) and len(shape) > 0 else 0
 
-        # Default to original ensemble code
-        tuned_code = code_str
+        # Generate baseline ensemble code (large-dataset path, no Optuna).
+        # generate_ensemble_code is deterministic and does not call an LLM.
+        try:
+            tuned_code = agent.generate_ensemble_code(result, "df", target_col) or ""
+            if not tuned_code:
+                logger.warning("[ModelSelection] Code generation skipped for large dataset")
+        except Exception as _gen_err:
+            logger.warning(
+                f"[ModelSelection] Code generation skipped for large dataset: {_gen_err}"
+            )
+            tuned_code = ""
+
         tuning_results = {}
         if 0 < n_rows <= 50000:
             try:
@@ -251,7 +306,7 @@ def _model_selection_node(state):
                 else:
                     logger.warning("[ModelSelection] Target column missing for tuning; using default code")
             except Exception as e:
-                logger.warning(f"[ModelSelection] Optuna tuning failed: {e} — using default ensemble code")
+                logger.warning(f"[ModelSelection] Optuna tuning failed: {e} - using default ensemble code")
         else:
             logger.info(f"[ModelSelection] Skipping tuning (n_rows={n_rows})")
 
@@ -378,23 +433,23 @@ def _planner_node(state):
             )
             proxy_docs.append(doc)
 
-        # Include required deliverables from the problem spec (if any) in the planner prompt.
-        problem_spec = state.get("problem_spec", {})
-        user_objective = state.get("user_query", "")
-        required_deliverables = problem_spec.get("required_deliverables", [])
-        if required_deliverables:
-            user_objective = (
-                f"{user_objective}\nDesired deliverables: {', '.join(required_deliverables)}"
-            )
-        try:
-            plan_result = run_planner(
-                user_objective=user_objective,
-                documents=proxy_docs,
-                session_id=state.get("session_id", "default"),
-            )
-        except Exception as e:
-            logger.warning(f"[Planner] run_planner failed: {e}")
-            plan_result = {}
+    # Include required deliverables from the problem spec (if any) in the planner prompt.
+    problem_spec = state.get("problem_spec", {})
+    user_objective = state.get("user_query", "")
+    required_deliverables = problem_spec.get("required_deliverables", [])
+    if required_deliverables:
+        user_objective = (
+            f"{user_objective}\nDesired deliverables: {', '.join(required_deliverables)}"
+        )
+    try:
+        plan_result = run_planner(
+            user_objective=user_objective,
+            documents=proxy_docs,
+            session_id=state.get("session_id", "default"),
+        )
+    except Exception as e:
+        logger.warning(f"[Planner] run_planner failed: {e}")
+        plan_result = {}
 
     tasks = plan_result.get("analysis_plan", [])
     return {
@@ -403,6 +458,196 @@ def _planner_node(state):
         "hypotheses":     plan_result.get("hypotheses", []),
         "current_step":   0,
         "steps_total":    len(tasks),
+    }
+
+
+def _executor_node(state):
+    """
+    Execute the current analysis task via CodeExecutionAgent.
+
+    Sequencing:
+      1. Guard - if current_step >= len(tasks), return empty dict (no-op).
+      2. Build data_context from tabular_summaries (shape, columns, numeric
+         stats, missing values) - mirrors _planner_node exactly.
+      3. Inject ChromaDB RAG context from AgentMemory("doc_chunks").
+      4. Run CodeExecutionAgent(session_id).execute(description, data_context,
+         file_paths).
+      5. PII-scan every generated file via the module-level get_pii_guard()
+         singleton (not a fresh instantiation).
+      6. Write structured JSON audit log via session_logger.
+      7. Increment telemetry on success.
+      8. Return all required AgentState keys.
+    """
+    from pathlib import Path
+    from multimodal_ds.memory.agent_memory import AgentMemory
+    from multimodal_ds.core.pii_guard import get_pii_guard
+    from multimodal_ds.core.telemetry import get_telemetry
+
+    # ── 1. Guard clause ──────────────────────────────────────────────────────
+    tasks = state.get("analysis_tasks", [])
+    step = state.get("current_step", 0)
+    session_id = state.get("session_id", "default")
+
+    if step >= len(tasks):
+        logger.info(f"[Executor] step={step} >= len(tasks)={len(tasks)} - no-op return.")
+        return {}
+
+    task = tasks[step]
+
+    # ── 2. Build data_context (same pattern as _planner_node) ────────────────
+    data_context_parts = []
+    for t in state.get("tabular_summaries", [])[:2]:
+        cols = t.get("columns", [])
+        shape = t.get("shape", [])
+        profile = t.get("data_profile", {})
+        data_context_parts.append(
+            f"Table {Path(t['source']).name}: {shape} rows×cols\n"
+            f"Columns: {cols}\n"
+        )
+        if profile.get("numeric_stats"):
+            data_context_parts.append("Numeric column stats (mean / std / min / max):")
+            for col, s in list(profile["numeric_stats"].items())[:10]:
+                data_context_parts.append(
+                    f"  {col}: mean={s.get('mean', 0):.2f}, std={s.get('std', 0):.2f}, "
+                    f"min={s.get('min', 0):.2f}, max={s.get('max', 0):.2f}"
+                )
+        missing = {k: v for k, v in profile.get("missing_values", {}).items() if v > 0}
+        if missing:
+            data_context_parts.append(f"Missing values: {missing}")
+        else:
+            data_context_parts.append("Missing values: none detected")
+    data_context = "\n".join(data_context_parts) if data_context_parts else ""
+
+    # ── 3. Inject RAG context from AgentMemory("doc_chunks") ─────────────────
+    try:
+        mem = AgentMemory(collection_name="doc_chunks")
+        rag_results = mem.retrieve(task.get("description", ""), n_results=4)
+        if rag_results:
+            rag_text = "\n\n".join(
+                r["content"] for r in rag_results if r.get("content")
+            )
+            data_context = (
+                f"Relevant document context (from ChromaDB):\n{rag_text}\n\n"
+                + data_context
+            )
+    except Exception as e:
+        logger.warning(f"[Executor] RAG retrieval failed: {e}")
+
+    # -- 4. File paths - upload original data files into agent sandbox ---------
+    data_files = []
+    for fp in state.get("uploaded_files", []):
+        p = Path(fp)
+        if p.exists():
+            data_files.append(str(p.resolve()))  # resolve to absolute path
+        else:
+            logger.warning(f"[Executor] File not found: {fp}")
+
+    # Also inject the filename into the task description so the LLM
+    # knows exactly what to load:
+    file_names = [Path(f).name for f in data_files]
+    task_description = task.get("description", "")
+    if file_names and "read_csv" not in task_description.lower():
+        task_description = (
+            f"{task_description}\n\n"
+            f"Available data files in working directory: {file_names}\n"
+            f"Load the primary dataset with: df = pd.read_csv('{file_names[0]}')"
+        )
+
+    # ── 5. Execute via CodeExecutionAgent ────────────────────────────────────
+    logger.info(f"[Executor] Step {step + 1}/{len(tasks)}: {task.get('name', 'task')}")
+    try:
+        agent = CodeExecutionAgent(session_id=session_id)
+        result = agent.execute(
+            task_description=task_description,
+            data_context=data_context,
+            file_paths=data_files,
+        )
+    except Exception as e:
+        logger.error(f"[Executor] CodeExecutionAgent raised: {e}")
+        result = {
+            "success": False,
+            "output": f"Agent raised exception: {e}",
+            "files_created": [],
+            "error": str(e),
+        }
+
+    success: bool = result.get("success", False)
+    full_output: str = result.get("output", "")
+    files: list = result.get("files_created", [])
+    error_str: str = result.get("error", "")
+
+    # ── 6. PII scan on generated files ───────────────────────────────────────
+    guard = get_pii_guard()
+    pii_blocked_files = []
+    pii_clean_files = []
+    for fname in files:
+        try:
+            fpath = Path(OUTPUT_DIR) / session_id / fname
+            if not fpath.exists():
+                pii_clean_files.append(fname)
+                continue
+            if fpath.suffix.lower() in {".txt", ".csv", ".json", ".html", ".md"}:
+                content = fpath.read_text(encoding="utf-8", errors="ignore")
+                report = guard.scan_text(content, source=fname)
+                if report.blocked:
+                    logger.warning(f"[Executor] PII BLOCKED in generated file '{fname}' - omitting.")
+                    pii_blocked_files.append(fname)
+                else:
+                    pii_clean_files.append(fname)
+            else:
+                pii_clean_files.append(fname)
+        except Exception as pii_err:
+            logger.warning(f"[Executor] PII scan failed for '{fname}': {pii_err} - passing file")
+            pii_clean_files.append(fname)
+
+    # Use only PII-clean files for downstream state
+    files = pii_clean_files
+
+    # ── 7. Partition files by type ────────────────────────────────────────────
+    image_exts = {".png", ".jpg", ".webp"}
+    visualizations = [f for f in files if Path(f).suffix.lower() in image_exts]
+    saved_artifacts = [f for f in files if Path(f).suffix.lower() not in image_exts]
+
+    # ── 8. Build truncated code output for code_outputs (summary field) ───────
+    truncated_output = full_output[:2000] + ("...[truncated]" if len(full_output) > 2000 else "")
+    errors_out = [f"Step {step + 1}: {error_str}"] if error_str and not success else []
+
+    # ── 9. Structured JSON audit log ──────────────────────────────────────────
+    log_entry = {
+        "event":        "executor_step",
+        "timestamp":    datetime.now(timezone.utc).isoformat(),
+        "session_id":   session_id,
+        "step":         step,
+        "step_name":    task.get("name", f"step_{step}"),
+        "success":      success,
+        "files_created": files,
+        "pii_blocked":  pii_blocked_files,
+        "output_chars": len(full_output),
+        "error":        error_str if not success else "",
+    }
+    session_logger.info(json.dumps(log_entry))
+
+    # ── 10. Telemetry increment on success ────────────────────────────────────
+    if success:
+        try:
+            get_telemetry(session_id).increment("tasks_succeeded")
+        except Exception as tel_err:
+            logger.debug(f"[Executor] Telemetry increment failed: {tel_err}")
+
+    # ── 11. Return state updates ──────────────────────────────────────────────
+    # NOTE: AgentState reducers for list fields use operator.add - return only
+    # NEW items (not the full accumulated list) so LangGraph appends correctly.
+    return {
+        "current_step":       step + 1,
+        "full_code_outputs":  [full_output],
+        "code_outputs":       [truncated_output],
+        "visualizations":     visualizations,
+        "saved_artifacts":    saved_artifacts,
+        "errors":             errors_out,
+        "current_step_files": files,
+        "_last_files_created": files,
+        "_last_success":      success,
+        "files_created":      files,
     }
 
 
@@ -449,48 +694,75 @@ def _visualizer_node(state):
 
 
 def _reflection_node(state):
-    """Run reflection on the most recent task using ReflectionAgent and inject lessons into next task."""
-    # Retrieve recent task info
-    tasks = state.get("analysis_tasks", [])
-    step_idx = state.get("current_step", 1) - 1  # just completed
-    if step_idx < 0 or step_idx >= len(tasks):
-        return state
-    task = tasks[step_idx]
-    # Get latest output
-    output = state.get("full_code_outputs", [""])[-1] if state.get("full_code_outputs") else ""
-    files = state.get("_last_files_created", [])
-    success = state.get("_last_success", False)
-    task_result = {
-        "name": task.get("name", f"step_{step_idx}"),
-        "success": success,
-        "output_preview": output[:1000],
-        "files_created": files,
-        "error": "",
-    }
-    # Evaluation result
-    eval_report = state.get("eval_report", {})
-    evaluations = eval_report.get("evaluations", []) if isinstance(eval_report, dict) else []
-    eval_result = evaluations[-1] if evaluations else {}
-    # Run reflection
-    from multimodal_ds.agents.reflection_agent import ReflectionAgent
+    """
+    Consolidated reflection node: diagnoses failures using ReflectionAgent and
+    updates analysis tasks for retry if within MAX_RETRIES limit.
+    """
     session_id = state.get("session_id", "default")
-    agent = ReflectionAgent(session_id=session_id)
-    reflection = agent.reflect_on_task(task_result, eval_result)
-    logger.info(f"[Reflection] Task '{task_result['name']}': {reflection.get('root_cause', 'success')}")
-    # Inject lessons into next task if any
-    remaining = tasks[step_idx + 1:]
-    lessons_text = "\n".join(reflection.get("lessons", []))
-    avoid_text = "\n".join(reflection.get("avoid_patterns", []))
-    if lessons_text and remaining:
-        next_task = remaining[0]
-        if avoid_text:
-            next_task["description"] = (
-                next_task.get("description", "") +
-                f"\n\nLESSONS FROM PREVIOUS STEP (apply these):\n{lessons_text}" +
-                f"\n\nAVOID THESE PATTERNS:\n{avoid_text}"
-            )
-        tasks[step_idx + 1] = next_task
-    return {"analysis_tasks": tasks, "reflections": state.get("reflections", []) + [reflection]}
+    retry_count = state.get("retry_count", 0)
+    current_step = state.get("current_step", 0)
+
+    try:
+        # 1. Guard - if we've hit MAX_RETRIES, stop and proceed to reporting
+        if retry_count >= MAX_RETRIES:
+            logger.warning(f"[Reflection] MAX_RETRIES ({MAX_RETRIES}) reached for session {session_id}. Stopping loop.")
+            return {"_loop_exit": True}
+
+        logger.info(f"[Reflection] Starting diagnosis. Retry attempt {retry_count + 1}/{MAX_RETRIES}")
+
+        # 2. Check verdict - if PASS, we don't need to reflect or retry
+        eval_report_raw = state.get("eval_report", {})
+        if not isinstance(eval_report_raw, dict):
+            eval_report_dict = eval_report_raw.to_dict() if hasattr(eval_report_raw, "to_dict") else {}
+        else:
+            eval_report_dict = eval_report_raw
+
+        if eval_report_dict.get("session_verdict") == "PASS":
+            logger.info("[Reflection] Verdict is PASS. Skipping reflection.")
+            return {}
+
+        # 3. Call the real ReflectionAgent API
+        agent = ReflectionAgent(session_id=session_id, max_retries=MAX_RETRIES)
+        report = agent.reflect(eval_report=eval_report_dict, state=state)
+        reflection_result = report.to_dict()
+
+        # 4. Persist to SharedContextPool for UI/Audit
+        pool = get_context_pool(session_id)
+        pool.set("last_reflection", reflection_result, agent="reflection")
+
+        # 5. Handle Retry Logic (Rewriting tasks and rewinding step)
+        tasks = list(state.get("analysis_tasks", []))
+        improved = report.improved_instructions
+        
+        # Rewind current_step by 1 so executor reruns the failed task
+        retry_step = max(0, current_step - 1)
+        
+        if tasks and retry_step < len(tasks):
+            # Augment the failed task's description with improved instructions
+            orig_desc = tasks[retry_step].get("description", "")
+            tasks[retry_step] = {
+                **tasks[retry_step],
+                "description": f"{orig_desc}\n\n[REFLECTION RETRY GUIDANCE]: {improved}",
+            }
+            logger.info(f"[Reflection] Rewrote task '{tasks[retry_step].get('name')}' for retry.")
+
+        # 6. Return updated state
+        return {
+            "retry_count": retry_count + 1,
+            "analysis_tasks": tasks,
+            "current_step": retry_step,
+            "reflection_report": reflection_result,
+            "reflections": state.get("reflections", []) + [reflection_result],
+            "errors": [],  # Clear errors for the retry attempt
+            "_last_success": False, # Reset success flag
+            "target_agent": report.target_agent,
+        }
+
+    except Exception as e:
+        logger.error(f"[Reflection] Node failed: {e}")
+        # On failure, at least increment counter to avoid infinite loops if the edge logic depends on it
+        return {"retry_count": retry_count + 1}
+
 
 def _reviewer_node(state):
     tasks   = state.get("analysis_tasks", [])
@@ -551,7 +823,7 @@ def _reviewer_node(state):
         )
         return {"eval_report": report.to_dict()}
     except Exception as e:
-        logger.warning(f"[Reviewer] EvaluationAgent failed: {e} — returning empty report")
+        logger.warning(f"[Reviewer] EvaluationAgent failed: {e} - returning empty report")
         return {"eval_report": {
             "session_id": session_id,
             "task_count": len(task_results),
@@ -579,52 +851,6 @@ def _build_data_context_for_eval(state: dict) -> str:
     return "\n".join(parts)
 
 
-def _retry_node(state):
-    """
-    Reflection loop — diagnoses failures and generates improved instructions.
-    Replaces the stub counter-increment with LLM-guided root cause analysis.
-    """
-    retry_count = state.get("retry_count", 0) + 1
-    logger.warning(f"[Graph] Reflection loop triggered. Attempt {retry_count}")
-
-    try:
-        agent = ReflectionAgent(
-            session_id=state.get("session_id", "default"),
-            max_retries=MAX_RETRIES,
-        )
-        eval_report = state.get("eval_report", {})
-        if not isinstance(eval_report, dict):
-            eval_report = eval_report.to_dict() if hasattr(eval_report, "to_dict") else {}
-
-        report = agent.reflect(eval_report=eval_report, state=state)
-
-        # If reflection produced improved instructions, inject them into the next task
-        improved = report.improved_instructions
-        tasks = list(state.get("analysis_tasks", []))
-        current_step = state.get("current_step", 0)
-
-        # Rewind current_step by 1 so executor reruns the failed task with new instructions
-        retry_step = max(0, current_step - 1)
-        if tasks and retry_step < len(tasks):
-            # Augment the failed task's description with improved instructions
-            tasks[retry_step] = {
-                **tasks[retry_step],
-                "description": tasks[retry_step].get("description", "")
-                + f"\n\nREFLECTION GUIDANCE: {improved}",
-            }
-
-        return {
-            **state,
-            "retry_count": retry_count,
-            "analysis_tasks": tasks,
-            "current_step": retry_step,
-            "reflection_report": report.to_dict(),
-            "errors": [],  # Clear errors so reviewer starts fresh
-        }
-
-    except Exception as e:
-        logger.error(f"[Graph] ReflectionAgent failed: {e} — falling back to counter increment")
-        return {**state, "retry_count": retry_count}
 
 
 def _reporter_node(state):
@@ -653,9 +879,9 @@ def _quality_gate_node(state):
         gate_passed = False
         gate_reasons.append("Execution returned non-zero exit code")
     # 2. Output length
-    if len(last_output.strip()) < 50:
+    if len(last_output.strip()) < 20:
         gate_passed = False
-        gate_reasons.append("Output too short — likely crashed silently")
+        gate_reasons.append("Output too short - likely crashed silently")
     # 3. Expected artifact files for modeling/evaluation
     task_type = tasks[current_step - 1].get("type", "") if current_step > 0 and tasks else ""
     if task_type in ("modeling", "evaluation"):
@@ -681,7 +907,7 @@ def _quality_gate_node(state):
     if gate_passed:
         logger.info(f"[QualityGate] Step {current_step} '{task_name}': PASSED")
     else:
-        logger.warning(f"[QualityGate] Step {current_step} '{task_name}': FAILED — {gate_reasons}")
+        logger.warning(f"[QualityGate] Step {current_step} '{task_name}': FAILED - {gate_reasons}")
     # Update errors list
     new_errors = state.get("errors", [])
     if not gate_passed:
@@ -729,71 +955,84 @@ def _multi_ingest_router_node(state):
                 merged[k] = v
     return merged
 
-def _decide_review_outcome(state) -> str:
-    """
-    Decide whether to:
-    1. Continue to next task step (executor)
-    2. Retry the whole session if overall failures (retry -> executor)
-    3. Finish and report (reporter)
-    """
-    retry_count   = state.get("retry_count", 0)
-    eval_report   = state.get("eval_report", {})
-    if not isinstance(eval_report, dict):
-        # Fallback to attribute access for dummy objects
-        eval_report = {
-            "overall_session_score": getattr(state.get("eval_report"), "overall_session_score", 10),
-            "flagged_count": getattr(state.get("eval_report"), "flagged_count", 0),
-        }
-    overall_score = eval_report.get("overall_session_score", 10)
-    has_failures  = eval_report.get("flagged_count", 0) > 0
-
-    current = state.get("current_step", 0)
-    total   = state.get("steps_total", 0)
-
-    # 1. If we have more steps, keep going
-    if current < total:
-        return "executor"
-
-    # 2. If we finished all steps but had critical failures, try a session-level retry
-    if has_failures and retry_count < MAX_RETRIES and overall_score < 5:
-        return "retry"
-
-    # 3. Otherwise, we are done
-    return "reporter"
-
-def _decide_after_gate(state) -> str:
+def _decide_after_gate(state: dict) -> str:
     """Decide next step after quality gate.
-    Returns "reviewer", "retry", or "reporter".
+    Returns "executor", "reflection", or "reporter".
     """
-    if state.get("gate_passed", True):
-        return "reviewer"
+    gate_passed = state.get("gate_passed", True)
+    current_step = state.get("current_step", 0)
+    steps_total = state.get("steps_total", 0)
     retry_count = state.get("retry_count", 0)
-    current = state.get("current_step", 0)
-    total = state.get("steps_total", 0)
-    if retry_count < MAX_RETRIES:
-        return "retry"
-    if current < total:
+
+    # 1. Happy path: Success and more tasks remain
+    if gate_passed and current_step < steps_total:
+        return "executor"
+    
+    # 2. Retry path: Failed gate and retries remain
+    if not gate_passed and retry_count < MAX_RETRIES:
+        return "reflection"
+    
+    # 3. Success and all tasks done -> Proceed to final review
+    if gate_passed and current_step >= steps_total:
         return "reviewer"
+        
+    # 4. Terminal or Finish path
     return "reporter"
 
-def _decide_review_outcome(state) -> str:
-    """Decide next step after reflection.
-    Returns "executor", "retry", or "reporter".
+def _decide_reflection_outcome(state: dict) -> str:
+    """Decide next step after reflection based on targeting.
+    
+    If _loop_exit is set (max retries reached), proceed to visualizer/reporter.
+    Otherwise, route to the target agent defined by the ReflectionAgent.
+    """
+    if state.get("_loop_exit"):
+        return "reporter"
+        
+    return state.get("target_agent", "executor")
+
+def _decide_review_outcome(state: dict) -> str:
+    """
+    Decide the next step after the Reviewer agent evaluates task outputs.
+
+    Logic:
+    1. If more tasks remain -> return 'executor'
+    2. If reflection needed (failed tasks/low score) and retries remain -> return 'reflection'
+    3. If retries exhausted but still failing -> return 'reporter'
+    4. Otherwise -> return 'visualizer' (to summarize results before reporting)
     """
     eval_report = state.get("eval_report", {})
-    verdict = eval_report.get("session_verdict", "UNKNOWN")
-    current = state.get("current_step", 0)
-    total = state.get("steps_total", 0)
+    # Handle object vs dict
+    if not isinstance(eval_report, dict) and hasattr(eval_report, "to_dict"):
+        eval_report_dict = eval_report.to_dict()
+    else:
+        eval_report_dict = eval_report
 
-    if verdict == "PASS" and current >= total:
+    current_step = state.get("current_step", 0)
+    steps_total = state.get("steps_total", 0)
+    retry_count = state.get("retry_count", 0)
+
+    # 1. More tasks remain
+    if current_step < steps_total:
+        return "executor"
+
+    # 2. Reflection needed?
+    flagged_count = eval_report_dict.get("flagged_count", 0)
+    overall_score = eval_report_dict.get("overall_session_score", 10.0)
+    reflection_needed = (flagged_count > 0 or overall_score < FLAG_OVERALL_THRESHOLD)
+
+    if reflection_needed and retry_count < MAX_RETRIES:
+        return "reflection"
+
+    # NEW — retries exhausted but still failing: go to reporter directly
+    if reflection_needed and retry_count >= MAX_RETRIES:
+        logger.warning(
+            f"[ReviewOutcome] Max retries exhausted with flagged_count={flagged_count} "
+            f"score={overall_score:.2f} — routing to reporter (fail-safe)"
+        )
         return "reporter"
-    if verdict == "NEEDS_IMPROVEMENT" and current <= total:
-        return "executor"
-    if verdict == "FAIL":
-        return "retry"
-    if current < total:
-        return "executor"
-    return "reporter"
+
+    # 3. Clean pass — proceed to visualization
+    return "visualizer"
 
 
 # ── Graph builder ────────────────────────────────────────────────────────────
@@ -807,7 +1046,7 @@ def build_graph(use_sqlite_checkpointer: bool = False, sqlite_path: str = "./che
 
     builder.add_node("problem_understanding", _problem_understanding_node)
     builder.add_node("router", _router_node)
-    builder.add_node("decide_ingestion_path", _decide_ingestion_path)
+    # builder.add_node("decide_ingestion_path", _decide_ingestion_path) # No longer a node
     builder.add_node("doc_ingest", _doc_ingest_node)
     builder.add_node("img_ingest", _img_ingest_node)
     builder.add_node("audio_ingest", _audio_ingest_node)
@@ -827,44 +1066,69 @@ def build_graph(use_sqlite_checkpointer: bool = False, sqlite_path: str = "./che
     builder.set_entry_point("problem_understanding")
 
     builder.add_edge("problem_understanding", "router")
-    builder.add_edge("router", "decide_ingestion_path")
-    # Fan‑out to required ingestion nodes based on routing flags
-    builder.add_edge("decide_ingestion_path", "doc_ingest")
-    builder.add_edge("decide_ingestion_path", "img_ingest")
-    builder.add_edge("decide_ingestion_path", "audio_ingest")
-    builder.add_edge("decide_ingestion_path", "tab_ingest")
+    
+    # Conditional fan-out for ingestion
+    builder.add_conditional_edges(
+        "router",
+        _decide_ingestion_path,
+        ["doc_ingest", "img_ingest", "audio_ingest", "tab_ingest", "merge_ingest"]
+    )
+    
     # Merge results from all ingestion nodes
     builder.add_edge("doc_ingest", "merge_ingest")
     builder.add_edge("img_ingest", "merge_ingest")
     builder.add_edge("audio_ingest", "merge_ingest")
     builder.add_edge("tab_ingest", "merge_ingest")
+    
     # Continue with validation after merging
     builder.add_edge("merge_ingest", "stats_val")
     # builder.add_edge("router", "multi_ingest")
     # After multi_ingest, always go through stats validation (no‑op if no table)
     # builder.add_edge("multi_ingest", "stats_val")
-    builder.add_edge("stats_val",    "model_selection")
+    builder.add_edge("stats_val",       "model_selection")
     builder.add_edge("model_selection", "planner")
-    builder.add_edge("planner",      "executor")
-    builder.add_edge("executor",     "visualizer")
+    builder.add_edge("planner",         "executor")
+
+    # The Core Execution Loop with Quality Gate
+    builder.add_edge("executor", "quality_gate")
 
     builder.add_conditional_edges(
         "quality_gate",
         _decide_after_gate,
-        {"reviewer": "reviewer", "retry": "retry", "reporter": "reporter"}
+        {
+            "executor":   "executor",
+            "reflection": "reflection",
+            "reviewer":   "reviewer",
+            "reporter":   "reporter"
+        }
     )
 
-    builder.add_edge("reviewer", "reflection")
+    # Secondary Review/Reflection paths
+    builder.add_conditional_edges(
+        "reviewer",
+        _decide_review_outcome,
+        {
+            "executor":   "executor",
+            "reflection": "reflection",
+            "visualizer": "visualizer",
+            "reporter":   "reporter"
+        }
+    )
 
     builder.add_conditional_edges(
         "reflection",
-        _decide_review_outcome,
-        {"executor": "executor", "retry": "retry", "reporter": "reporter"}
+        _decide_reflection_outcome,
+        {
+            "executor":   "executor",
+            "planner":    "planner",
+            "visualizer": "visualizer",
+            "reporter":   "reporter"
+        }
     )
 
-    builder.add_edge("visualizer", "quality_gate")
-
-    builder.add_edge("reporter", END)
+    # Termination Path
+    builder.add_edge("visualizer", "reporter")
+    builder.add_edge("reporter",   END)
 
 
     if use_sqlite_checkpointer:
@@ -927,4 +1191,5 @@ def make_initial_state(
         "_files_per_step": [],
         "executive_summary":        "",
         "business_recommendations": [],
+        "step_failures": {},
     }

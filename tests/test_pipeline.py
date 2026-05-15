@@ -260,3 +260,48 @@ class TestAPI:
     def test_output_not_found(self, api_client):
         resp = api_client.get("/output/nonexistent_xyz")
         assert resp.status_code == 404
+
+
+# ── Graph parallel ingestion tests ───────────────────────────────────────────
+
+class TestGraphParallel:
+    def test_parallel_ingestion_csv_txt(self, sample_csv, sample_txt):
+        from multimodal_ds.graph import build_graph, make_initial_state
+        
+        # 1. Setup initial state with both CSV and TXT
+        state = make_initial_state(
+            user_query="Analyze my data and notes",
+            uploaded_files=[str(sample_csv), str(sample_txt)]
+        )
+        
+        # 2. Build and compile graph
+        app = build_graph(use_sqlite_checkpointer=False)
+        
+        # 3. Execute graph and capture node executions
+        # We limit the run up to merge_ingest to keep the test fast and avoid LLM calls
+        # We can use interrupt_after or simply check node_names in stream
+        node_names = []
+        
+        config = {"configurable": {"thread_id": "test_parallel"}}
+        # Note: In a real test we might want to mock the agents to avoid actual LLM calls
+        # if the test continues past ingestion.
+        try:
+            for output in app.stream(state, config=config):
+                for node_name in output.keys():
+                    node_names.append(node_name)
+                    if node_name == "merge_ingest":
+                        raise StopIteration # Stop after ingestion merge
+        except StopIteration:
+            pass
+
+        # 4. Assertions
+        assert "tab_ingest" in node_names, "tab_ingest should have run"
+        assert "doc_ingest" in node_names, "doc_ingest should have run"
+        assert "img_ingest" not in node_names, "img_ingest should NOT have run"
+        assert "audio_ingest" not in node_names, "audio_ingest should NOT have run"
+        assert "merge_ingest" in node_names, "merge_ingest should have run"
+        
+        # Check that state was merged correctly
+        full_final_state = app.get_state(config).values
+        assert len(full_final_state["tabular_summaries"]) > 0, "Tabular summaries should be present"
+        assert len(full_final_state["parsed_documents"]) > 0, "Parsed documents should be present"

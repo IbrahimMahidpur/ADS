@@ -1,10 +1,10 @@
 """
-PDF Ingestion — uses PyMuPDF for text extraction.
+PDF Ingestion - uses PyMuPDF for text extraction.
 Falls back to LLaVA (vision model via Ollama) for scanned/image PDFs.
 
 PII integration:
   After text extraction, PIIGuard scans the full extracted text.
-  On hit: status → BLOCKED, text_content cleared, pii_report stored in metadata.
+  On hit: status -> BLOCKED, text_content cleared, pii_report stored in metadata.
   Vision-extracted pages are also scanned before being appended.
 """
 import logging
@@ -59,7 +59,7 @@ def ingest_pdf(file_path: str) -> UnifiedDocument:
 
         # If >50% pages are image-based, use vision model
         if len(image_pages) > doc.page_count * 0.5:
-            logger.info(f"[PDF] Scanned PDF detected — using vision model for {len(image_pages)} pages")
+            logger.info(f"[PDF] Scanned PDF detected - using vision model for {len(image_pages)} pages")
             vision_texts = _extract_with_vision(pdf, image_pages, file_path)
             doc.text_content += "\n\n" + "\n\n".join(vision_texts)
             doc.provenance.model_used = VISION_MODEL
@@ -68,7 +68,7 @@ def ingest_pdf(file_path: str) -> UnifiedDocument:
 
         pdf.close()
 
-        # ── PII scan — runs on all extracted text ──────────────────────────
+        # --- PII scan - runs on all extracted text -------------------------
         doc = _run_pdf_pii_scan(doc)
 
         # Only mark DONE if PII scan didn't block
@@ -82,7 +82,7 @@ def ingest_pdf(file_path: str) -> UnifiedDocument:
 
     doc.provenance.processing_time_s = round(time.time() - t0, 2)
     logger.info(
-        f"[PDF] Ingested {path.name} — {doc.page_count} pages, "
+        f"[PDF] Ingested {path.name} - {doc.page_count} pages, "
         f"status={doc.status.value} in {doc.provenance.processing_time_s}s"
     )
     return doc
@@ -115,27 +115,27 @@ def _run_pdf_pii_scan(doc: UnifiedDocument) -> UnifiedDocument:
 
         if pii_report.blocked:
             logger.warning(
-                f"[PDF] PII BLOCKED — "
+                f"[PDF] PII BLOCKED - "
                 f"entities: {pii_report.entity_types_found}"
             )
             doc.status = ProcessingStatus.BLOCKED
             doc.text_content = (
-                f"[BLOCKED: PII detected — entity types: "
+                f"[BLOCKED: PII detected - entity types: "
                 f"{', '.join(pii_report.entity_types_found)}]"
             )
 
     except Exception as e:
-        logger.error(f"[PDF] PII scan failed: {e} — blocking as fail-safe")
+        logger.error(f"[PDF] PII scan failed: {e} - blocking as fail-safe")
         doc.status = ProcessingStatus.BLOCKED
         doc.metadata["pii_report"] = {"blocked": True, "error": str(e)}
-        doc.text_content = "[BLOCKED: PII scan error — fail-safe block applied]"
+        doc.text_content = "[BLOCKED: PII scan error - fail-safe block applied]"
 
     return doc
 
 
 def _extract_with_vision(pdf, page_nums: list[int], file_path: str) -> list[str]:
-    """Use either ColPali (preferred) or the fallback LLaVA vision model to describe image‑only PDF pages.
-    Returns a list of page‑wise textual descriptions.
+    """Use either ColPali (preferred) or the fallback LLaVA vision model to describe image-only PDF pages.
+    Returns a list of page-wise textual descriptions.
     """
     # Try ColPali first
     try:
@@ -147,7 +147,7 @@ def _extract_with_vision(pdf, page_nums: list[int], file_path: str) -> list[str]
     except Exception as e:
         logger.warning(f"[PDF Vision] ColPali extraction failed: {e}")
 
-    # Fallback to original LLaVA‑based vision extraction
+    # Fallback to original LLaVA-based vision extraction
     import base64
     import httpx
 
@@ -174,9 +174,8 @@ def _extract_with_vision(pdf, page_nums: list[int], file_path: str) -> list[str]
             )
             if response.status_code == 200:
                 text = response.json().get("response", "")
-                results.append(f"[Page {page_num + 1} — Vision]\n{text}")
+                results.append(f"[Page {page_num + 1} - Vision]\n{text}")
         except Exception as e:
             logger.warning(f"[PDF Vision] Page {page_num} failed: {e}")
 
     return results
-

@@ -1,12 +1,12 @@
 """
-Tabular Data Ingestion — pandas profiling + FLAML AutoML suggestions.
+Tabular Data Ingestion - pandas profiling + task heuristics.
 Handles CSV, Excel, Parquet, JSON tabular files.
 
 PII integration (Conversation 5):
   After profiling, PIIGuard scans:
-    1. Column names — pattern match (e.g. 'ssn', 'credit_card')
-    2. Column values — presidio/regex scan on sampled string columns
-  On hit: status → BLOCKED, structured_data cleared, pii_report stored in metadata.
+    1. Column names - pattern match (e.g. 'ssn', 'credit_card')
+    2. Column values - presidio/regex scan on sampled string columns
+  On hit: status -> BLOCKED, structured_data cleared, pii_report stored in metadata.
   The router also runs a top-level gate, but this module gates early so
   profiling stats never get stored for PII-containing data either.
 """
@@ -30,7 +30,7 @@ def ingest_tabular(file_path: str) -> UnifiedDocument:
     - Schema detection
     - Statistical profiling
     - PII scan (column names + sampled values)
-    - FLAML AutoML task suggestion
+    - Heuristic-based ML task suggestion
     - Missing value / outlier summary
     """
     path = Path(file_path)
@@ -71,7 +71,7 @@ def ingest_tabular(file_path: str) -> UnifiedDocument:
         doc.metadata["automl_suggestion"] = _suggest_automl_task(df)
         doc.metadata["file_format"] = path.suffix.lower()
 
-        # ── PII scan (tabular-specific: column names + values) ─────────────
+        # --- PII scan (tabular-specific: column names + values) ------------
         # Note: router.py also runs a gate, but scanning here means we block
         # before profiling stats are ever written downstream.
         doc = _run_tabular_pii_scan(doc, df)
@@ -87,7 +87,7 @@ def ingest_tabular(file_path: str) -> UnifiedDocument:
 
     doc.provenance.processing_time_s = round(time.time() - t0, 2)
     logger.info(
-        f"[Tabular] Ingested {path.name} — "
+        f"[Tabular] Ingested {path.name} - "
         f"status={doc.status.value} in {doc.provenance.processing_time_s}s"
     )
     return doc
@@ -117,26 +117,26 @@ def _run_tabular_pii_scan(doc: UnifiedDocument, df: pd.DataFrame) -> UnifiedDocu
 
         if pii_report.blocked:
             logger.warning(
-                f"[Tabular] PII BLOCKED — "
+                f"[Tabular] PII BLOCKED - "
                 f"entities: {pii_report.entity_types_found}, "
                 f"surfaces: {pii_report.blocked_surfaces}"
             )
             doc.status = ProcessingStatus.BLOCKED
             doc.structured_data = None
             doc.text_content = (
-                f"[BLOCKED: PII detected — entity types: "
+                f"[BLOCKED: PII detected - entity types: "
                 f"{', '.join(pii_report.entity_types_found)}]"
             )
-            # Clear profiling data too — don't leak stats about PII columns
+            # Clear profiling data too - don't leak stats about PII columns
             doc.data_profile = {}
             doc.schema_info = {}
 
     except Exception as e:
-        logger.error(f"[Tabular] PII scan failed: {e} — blocking as fail-safe")
+        logger.error(f"[Tabular] PII scan failed: {e} - blocking as fail-safe")
         doc.status = ProcessingStatus.BLOCKED
         doc.metadata["pii_report"] = {"blocked": True, "error": str(e)}
         doc.structured_data = None
-        doc.text_content = "[BLOCKED: PII scan error — fail-safe block applied]"
+        doc.text_content = "[BLOCKED: PII scan error - fail-safe block applied]"
 
     return doc
 
@@ -196,7 +196,7 @@ def _compute_profile(df: pd.DataFrame) -> dict:
     
     # Expensive operations on large datasets
     if is_large:
-        logger.info(f"[Tabular] Large dataset ({len(df)} rows) — skipping expensive duplicate check and deep memory usage")
+        logger.info(f"[Tabular] Large dataset ({len(df)} rows) - skipping expensive duplicate check and deep memory usage")
         profile["duplicate_rows"] = "skipped (large dataset)"
         profile["memory_mb"] = round(float(df.memory_usage(deep=False).sum() / 1e6), 2)
     else:
@@ -207,7 +207,7 @@ def _compute_profile(df: pd.DataFrame) -> dict:
     cat_cols = df.select_dtypes(include=["object", "category"]).columns
     profile["cardinality"] = {col: int(df[col].nunique()) for col in cat_cols}
 
-    # Outlier detection (IQR method) — sample rows if massive to save time
+    # Outlier detection (IQR method) - sample rows if massive to save time
     outlier_counts = {}
     outlier_df = numeric_df
     if len(numeric_df) > 10_000:
@@ -237,7 +237,7 @@ def _generate_text_summary(df: pd.DataFrame, schema: dict, profile: dict) -> str
     top_missing = sorted(profile["missing_pct"].items(), key=lambda x: -x[1])[:3]
 
     lines = [
-        f"Dataset: {rows} rows × {cols} columns",
+        f"Dataset: {rows} rows x {cols} columns",
         f"Numeric columns ({len(schema['numeric_cols'])}): {', '.join(schema['numeric_cols'][:5])}{'...' if len(schema['numeric_cols']) > 5 else ''}",
         f"Categorical columns ({len(schema['categorical_cols'])}): {', '.join(schema['categorical_cols'][:5])}",
         f"Missing values: {missing_total} total",
@@ -251,7 +251,7 @@ def _generate_text_summary(df: pd.DataFrame, schema: dict, profile: dict) -> str
 
     # Add describe stats
     if "numeric_stats" in profile:
-        lines.append("\nNumeric Summary (first 20 columns, mean ± std):")
+        lines.append("\nNumeric Summary (first 20 columns, mean +/- std):")
         for i, (col, stats) in enumerate(profile["numeric_stats"].items()):
             if i >= 20:
                 lines.append("  ... [remaining columns truncated] ...")
@@ -269,22 +269,22 @@ def _generate_text_summary(df: pd.DataFrame, schema: dict, profile: dict) -> str
 def _suggest_automl_task(df: pd.DataFrame) -> dict:
     """Suggest ML task type based on data profile."""
     suggestion = {"task": "unknown", "target_candidates": [], "reason": ""}
-
-    last_col = df.columns[-1] if len(df.columns) > 0 else None
-    if last_col:
-        n_unique = df[last_col].nunique()
-        if n_unique <= 20 and df[last_col].dtype in [object, "category"] or n_unique <= 10:
-            suggestion["task"] = "classification"
-            suggestion["target_candidates"] = [last_col]
-            suggestion["reason"] = (
-                f"Last column '{last_col}' has {n_unique} unique values — "
-                "likely classification target"
-            )
-        elif pd.api.types.is_numeric_dtype(df[last_col]):
-            suggestion["task"] = "regression"
-            suggestion["target_candidates"] = [last_col]
-            suggestion["reason"] = (
-                f"Last column '{last_col}' is numeric — likely regression target"
-            )
-
+    if df.empty or len(df.columns) == 0:
+        return suggestion
+    last_col = df.columns[-1]
+    n_unique = df[last_col].nunique()
+    n_rows = len(df)
+    if n_unique <= 20 or (n_unique / n_rows < 0.05):
+        suggestion["task"] = "classification"
+        suggestion["target_candidates"] = [last_col]
+        suggestion["reason"] = (
+            f"'{last_col}' has {n_unique} unique values "
+            f"({n_unique/n_rows*100:.1f}% of rows) — classification target"
+        )
+    elif pd.api.types.is_numeric_dtype(df[last_col]):
+        suggestion["task"] = "regression"
+        suggestion["target_candidates"] = [last_col]
+        suggestion["reason"] = (
+            f"'{last_col}' is continuous numeric — regression target"
+        )
     return suggestion

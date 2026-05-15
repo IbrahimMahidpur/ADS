@@ -51,13 +51,33 @@ class SharedContextPool:
         with self._lock:
             return {k: e.value for k, e in self._store.items()}
 
-    def get_summary(self) -> str:
+    def get_summary(self, max_chars: int = 1500, keys_only: bool = False, exclude_keywords: Optional[List[str]] = None) -> str:
         """Return a natural language summary of all context for LLM injection."""
         with self._lock:
+            if not self._store:
+                return "No shared context yet."
+                
+            sorted_entries = sorted(
+                self._store.items(), 
+                key=lambda item: item[1].timestamp, 
+                reverse=True
+            )
+            
             parts = []
-            for key, entry in self._store.items():
-                parts.append(f"[{entry.agent}] {key}: {str(entry.value)[:200]}")
-            return "\n".join(parts) if parts else "No shared context yet."
+            for key, entry in sorted_entries:
+                if exclude_keywords and any(kw.lower() in key.lower() for kw in exclude_keywords):
+                    continue
+                if keys_only:
+                    parts.append(f"[{entry.agent}] {key}")
+                else:
+                    parts.append(f"[{entry.agent}] {key}: {str(entry.value)[:200]}")
+            
+            summary = "\n".join(parts)
+            if not summary:
+                return "No shared context yet."
+            if len(summary) > max_chars:
+                summary = summary[:max_chars] + "\n... [context truncated for prompt budget]"
+            return summary
 
     def append_to_list(self, key: str, item: Any, agent: str) -> None:
         with self._lock:

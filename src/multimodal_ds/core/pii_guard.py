@@ -1,8 +1,8 @@
 """
-PII Guard — hard gate for all ingestion pipelines.
+PII Guard - hard gate for all ingestion pipelines.
 
 Uses Microsoft Presidio to detect PII before any data enters the system.
-This is NOT a warning layer — detected PII blocks ingestion entirely and
+This is NOT a warning layer - detected PII blocks ingestion entirely and
 returns ProcessingStatus.BLOCKED with entity types listed.
 
 Detection surfaces:
@@ -49,7 +49,7 @@ logger = logging.getLogger(__name__)
 
 # ── Configurable entity list ───────────────────────────────────────────────
 # NOTE: PERSON is intentionally excluded from tabular scans.
-# Health/survey datasets use numeric response codes — Presidio misidentifies
+# Health/survey datasets use numeric response codes - Presidio misidentifies
 # integer-valued cells as person names causing false-positive blocks.
 # PERSON is still checked in free-text (PDF/text) scans.
 _DEFAULT_ENTITIES = [
@@ -82,7 +82,7 @@ _SENSITIVE_COLUMN_PATTERNS = re.compile(
 class PIIFinding:
     """Single PII detection result."""
     entity_type: str
-    text: str           # Redacted in logs — shown as first 4 chars + ***
+    text: str           # Redacted in logs - shown as first 4 chars + ***
     score: float        # Presidio confidence 0.0–1.0
     surface: str        # "text", "column_name", "column_value"
     column: Optional[str] = None  # For tabular findings
@@ -101,7 +101,7 @@ class PIIFinding:
 class PIIReport:
     """
     Aggregated PII scan result.
-    Always returned — callers check .blocked to gate ingestion.
+    Always returned - callers check .blocked to gate ingestion.
     """
     blocked: bool
     findings: list[PIIFinding] = field(default_factory=list)
@@ -145,9 +145,9 @@ class PIIReport:
     def error_report(cls, error: str) -> "PIIReport":
         """
         Used when PII scanning itself fails.
-        BLOCKS by default — fail-safe, never fail-open.
+        BLOCKS by default - fail-safe, never fail-open.
         """
-        logger.error(f"[PIIGuard] Scan failed: {error} — blocking as fail-safe")
+        logger.error(f"[PIIGuard] Scan failed: {error} - blocking as fail-safe")
         return cls(
             blocked=True,
             error=error,
@@ -167,7 +167,7 @@ class PIIGuard:
     we fall back to regex. If regex itself errors, we block. The system
     never silently passes data it hasn't checked."
 
-    Initialization is lazy — presidio loaded once on first scan.
+    Initialization is lazy - presidio loaded once on first scan.
     """
 
     def __init__(
@@ -195,7 +195,7 @@ class PIIGuard:
     def scan_text(self, text: str, source: str = "text") -> PIIReport:
         """
         Scan free text (PDF, plain text, transcripts).
-        Truncates to 50k chars — prevents memory explosion on huge docs.
+        Truncates to 50k chars - prevents memory explosion on huge docs.
         Uses _TEXT_ONLY_ENTITIES which includes PERSON (safe for prose text).
         """
         if not self.enabled:
@@ -219,7 +219,7 @@ class PIIGuard:
             )
             if blocked:
                 logger.warning(
-                    f"[PIIGuard] BLOCKED {source} — "
+                    f"[PIIGuard] BLOCKED {source} - "
                     f"entities: {report.entity_types_found}"
                 )
             return report
@@ -230,8 +230,8 @@ class PIIGuard:
     def scan_dataframe(self, df: pd.DataFrame, source: str = "dataframe") -> PIIReport:
         """
         Scan a DataFrame:
-          1. Column names — pattern match against sensitive name list
-          2. Column values — presidio/regex scan on sampled string columns
+          1. Column names - pattern match against sensitive name list
+          2. Column values - presidio/regex scan on sampled string columns
 
         Both paths can block independently.
         """
@@ -257,7 +257,7 @@ class PIIGuard:
 
             # ── Pass 2: Column value scan (string columns only, sampled) ──
             # Skip columns whose values look like numeric codes (e.g. survey
-            # response codes: 1, 2, 3, 88, 99) — these are NOT free text
+            # response codes: 1, 2, 3, 88, 99) - these are NOT free text
             # and consistently cause false-positive PERSON detections.
             sample_df = df.head(self.sample_rows)
             str_cols = df.select_dtypes(include=["object"]).columns.tolist()
@@ -298,7 +298,7 @@ class PIIGuard:
             )
             if blocked:
                 logger.warning(
-                    f"[PIIGuard] BLOCKED {source} — "
+                    f"[PIIGuard] BLOCKED {source} - "
                     f"surfaces: {report.blocked_surfaces}, "
                     f"entities: {report.entity_types_found}"
                 )
@@ -321,7 +321,7 @@ class PIIGuard:
             try:
                 return self._presidio_scan(text, surface, column, entities_override)
             except Exception as e:
-                logger.warning(f"[PIIGuard] Presidio scan failed: {e} — falling back to regex")
+                logger.warning(f"[PIIGuard] Presidio scan failed: {e} - falling back to regex")
                 self._use_presidio = False
 
         return self._regex_scan(text, surface, column)
@@ -360,8 +360,8 @@ class PIIGuard:
         column: Optional[str],
     ) -> list[PIIFinding]:
         """
-        Regex fallback — runs when presidio/spaCy unavailable.
-        Covers SSN, credit card, email, phone — the highest-risk entities.
+        Regex fallback - runs when presidio/spaCy unavailable.
+        Covers SSN, credit card, email, phone - the highest-risk entities.
         Interview point: "We never fail-open. Regex catches the obvious
         cases even without the ML model."
         """
@@ -409,9 +409,9 @@ class PIIGuard:
                     logger.warning(f"[PIIGuard] spaCy model '{model}' not found, trying next")
                     continue
 
-            # All spaCy models missing — use presidio without NLP (pattern-only)
+            # All spaCy models missing - use presidio without NLP (pattern-only)
             logger.warning(
-                "[PIIGuard] No spaCy model found — using presidio pattern-only mode. "
+                "[PIIGuard] No spaCy model found - using presidio pattern-only mode. "
                 "Run: python -m spacy download en_core_web_sm"
             )
             self._analyzer = AnalyzerEngine()
@@ -419,7 +419,7 @@ class PIIGuard:
 
         except ImportError:
             logger.warning(
-                "[PIIGuard] presidio-analyzer not installed — falling back to regex scanner. "
+                "[PIIGuard] presidio-analyzer not installed - falling back to regex scanner. "
                 "Run: pip install presidio-analyzer presidio-anonymizer"
             )
             self._use_presidio = False
@@ -427,7 +427,7 @@ class PIIGuard:
 
 
 # ── Module-level singleton ─────────────────────────────────────────────────
-# Import this in ingestion modules — one guard instance per process.
+# Import this in ingestion modules - one guard instance per process.
 
 _guard: Optional[PIIGuard] = None
 

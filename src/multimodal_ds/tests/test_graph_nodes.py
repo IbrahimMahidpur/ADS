@@ -40,7 +40,7 @@ class DummyEvaluationAgent:
         # Return a dummy report that just echoes the task results
         return DummyEvalReport(task_results)
 
-# Monkey‑patch the agents used inside the graph module
+# Monkey-patch the agents used inside the graph module
 import multimodal_ds.graph as graph
 graph.CodeExecutionAgent = DummyCodeExecutionAgent
 graph.EvaluationAgent = DummyEvaluationAgent

@@ -1,11 +1,11 @@
 """
-Ingestion Router Agent — detects file type and routes to correct ingestion module.
+Ingestion Router Agent - detects file type and routes to correct ingestion module.
 This is the entry point for ALL data ingestion in the system.
 
 PII gate (added Conversation 5):
   Every document passes through PIIGuard before being returned.
   If PII is detected the document status is set to BLOCKED and ingestion
-  stops — the structured_data and text_content are cleared so nothing
+  stops - the structured_data and text_content are cleared so nothing
   leaks downstream.
 
   Block behavior is identical regardless of detection surface:
@@ -27,7 +27,7 @@ from multimodal_ds.ingestion.tabular_ingestion import ingest_tabular, SUPPORTED_
 
 logger = logging.getLogger(__name__)
 
-# Lazy import — PIIGuard only loaded when config enables it
+# Lazy import - PIIGuard only loaded when config enables it
 def _get_pii_guard():
     from multimodal_ds.config import ENABLE_PII
     if not ENABLE_PII:
@@ -36,7 +36,7 @@ def _get_pii_guard():
         from multimodal_ds.core.pii_guard import get_pii_guard
         return get_pii_guard()
     except ImportError:
-        logger.warning("[Router] pii_guard module not found — PII scanning disabled")
+        logger.warning("[Router] pii_guard module not found - PII scanning disabled")
         return None
 
 
@@ -48,13 +48,13 @@ def _apply_pii_gate(doc: UnifiedDocument) -> UnifiedDocument:
     Interview answer to "how do you handle sensitive data?":
       We gate at ingestion. Before any downstream agent sees the document,
       presidio scans text and tabular values. On a hit, we block and record
-      entity types. Nothing leaks — structured_data and text_content are
+      entity types. Nothing leaks - structured_data and text_content are
       cleared on BLOCKED documents.
     """
     # Guard: skip scanning if document already has a PII report (already processed)
     if doc.metadata.get("pii_report"):
         logger.debug(
-            f"[Router] Skipping PII scan for already‑processed document "
+            f"[Router] Skipping PII scan for already-processed document "
             f"{Path(doc.provenance.source_path).name}"
         )
         return doc
@@ -80,7 +80,7 @@ def _apply_pii_gate(doc: UnifiedDocument) -> UnifiedDocument:
             )
 
     except Exception as e:
-        logger.error(f"[Router] PII scan raised unexpectedly: {e} — blocking as fail-safe")
+        logger.error(f"[Router] PII scan raised unexpectedly: {e} - blocking as fail-safe")
         doc.status = ProcessingStatus.BLOCKED
         doc.metadata["pii_report"] = {"blocked": True, "error": str(e), "scan_method": "error"}
         doc.text_content = ""
@@ -95,14 +95,14 @@ def _apply_pii_gate(doc: UnifiedDocument) -> UnifiedDocument:
 
     if pii_report.blocked:
         logger.warning(
-            f"[Router] PII BLOCKED — {Path(doc.provenance.source_path).name} "
+            f"[Router] PII BLOCKED - {Path(doc.provenance.source_path).name} "
             f"| entities: {pii_report.entity_types_found} "
             f"| surfaces: {pii_report.blocked_surfaces}"
         )
         doc.status = ProcessingStatus.BLOCKED
-        # Clear sensitive content — never let it reach downstream agents
+        # Clear sensitive content - never let it reach downstream agents
         doc.text_content = (
-            f"[BLOCKED: PII detected — entity types: "
+            f"[BLOCKED: PII detected - entity types: "
             f"{', '.join(pii_report.entity_types_found)}]"
         )
         doc.structured_data = None
@@ -139,10 +139,10 @@ def route_and_ingest(file_path: str) -> UnifiedDocument:
         doc = _ingest_plain_text(file_path)
 
     else:
-        logger.warning(f"[Router] Unknown file type: {ext} — attempting text ingestion")
+        logger.warning(f"[Router] Unknown file type: {ext} - attempting text ingestion")
         doc = _ingest_plain_text(file_path)
 
-    # ── PII gate — runs on every document regardless of type ──────────────
+    # --- PII gate - runs on every document regardless of type -------------
     # Only gate documents that were successfully processed
     if doc.status == ProcessingStatus.DONE:
         doc = _apply_pii_gate(doc)
@@ -154,7 +154,7 @@ def ingest_multiple(file_paths: list[str]) -> list[UnifiedDocument]:
     """
     Ingest multiple files and return list of UnifiedDocuments.
     BLOCKED documents are included in the result so callers can
-    report them — they are not silently dropped.
+    report them - they are not silently dropped.
     """
     results = []
     for fp in file_paths:
@@ -163,7 +163,7 @@ def ingest_multiple(file_paths: list[str]) -> list[UnifiedDocument]:
             status_label = doc.status.value.upper()
             if doc.status == ProcessingStatus.BLOCKED:
                 logger.warning(
-                    f"[Router] [BLOCKED] {Path(fp).name} — "
+                    f"[Router] [BLOCKED] {Path(fp).name} - "
                     f"PII: {doc.metadata.get('pii_report', {}).get('entity_types_found', [])}"
                 )
             else:

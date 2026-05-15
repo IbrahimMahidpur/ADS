@@ -1,5 +1,5 @@
 """
-Session telemetry — lightweight structured logging for production observability.
+Session telemetry - lightweight structured logging for production observability.
 Writes JSONL to agentic_output/{session_id}/telemetry.jsonl
 """
 from __future__ import annotations

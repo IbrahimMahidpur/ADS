@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Optional
 import uuid
@@ -23,7 +23,7 @@ class ProcessingStatus(str, Enum):
 @dataclass
 class Provenance:
     source_path: str
-    ingested_at: str = field(default_factory=lambda: datetime.utcnow().isoformat())
+    ingested_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     processor: str = ""
     model_used: str = ""
     processing_time_s: float = 0.0

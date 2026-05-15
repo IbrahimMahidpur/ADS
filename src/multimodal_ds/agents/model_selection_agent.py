@@ -1,6 +1,6 @@
 '''Model Selection Agent
 
-This module implements a rule‑based agent that selects a primary model and an
+This module implements a rule-based agent that selects a primary model and an
 ensemble of candidate models based on data characteristics derived from a
 statistical report and an AutoML suggestion. The logic is deterministic and does
 not involve any LLM calls.
@@ -45,12 +45,12 @@ def _is_module_available(module_name: str) -> bool:
 # ---------------------------------------------------------------------------
 
 class ModelSelectionAgent:
-    """Rule‑based model selector.
+    """Rule-based model selector.
 
     The agent inspects a :class:`pandas.DataFrame`, a statistical report and an
     AutoML suggestion to produce a dictionary describing the chosen primary model,
-    an ensemble of auxiliary models, preprocessing steps, hyper‑parameter
-    grid, cross‑validation strategy, scoring metric and a short rationale.
+    an ensemble of auxiliary models, preprocessing steps, hyper-parameter
+    grid, cross-validation strategy, scoring metric and a short rationale.
 
     The result is stored in the shared context pool under the key
     ``"model_selection"``.
@@ -85,7 +85,7 @@ class ModelSelectionAgent:
     ) -> Dict[str, Any]:
         """Select primary and ensemble models based on data characteristics.
 
-        The function follows a deterministic rule‑set (see the module level
+        The function follows a deterministic rule-set (see the module level
         documentation for the full decision tree).
         """
         # 1. Determine task type
@@ -103,7 +103,7 @@ class ModelSelectionAgent:
         has_multicollinearity = multicollinearity_info.get("multicollinearity_detected", False)
         n_strong_correlations = stat_report.get("correlation", {}).get("n_strong", 0)
 
-        # 4. Classification‑specific balance check
+        # 4. Classification-specific balance check
         is_imbalanced = False
         if task_type == "classification":
             if target_col in df.columns:
@@ -242,12 +242,14 @@ class ModelSelectionAgent:
         result: Dict[str, Any] = {
             "primary_model": primary_model,
             "ensemble_models": ensemble_models,
+            "recommended_models": [primary_model] + ensemble_models,
             "rationale": ", ".join(rationale_parts) if rationale_parts else "",
             "cv_strategy": cv_strategy,
             "scoring_metric": scoring_metric,
             "preprocessing_steps": preprocessing_steps,
-+            "tuning_available": True,
-+            "tuning_metadata": {},
+            "hyperparameter_grid": hyperparameter_grid,
+            "tuning_available": True,
+            "tuning_metadata": {},
         }
 
         # Store in shared context pool for downstream consumption
@@ -261,17 +263,17 @@ class ModelSelectionAgent:
         df_varname: str = "df",
         target_col: str = "target",
     ) -> str:
-        """Return a self‑contained Python script implementing the selected models.
+        """Return a self-contained Python script implementing the selected models.
 
         The generated code:
-        * Imports the necessary scikit‑learn (and optional) classes.
+        * Imports the necessary scikit-learn (and optional) classes.
         * Builds a ``VotingClassifier`` or ``VotingRegressor`` depending on the
           task type inferred from ``selection['primary_model']``.
         * Executes ``cross_val_score`` with the requested CV strategy and
           scoring metric.
         * Wraps the primary model in a ``GridSearchCV`` using the supplied
           ``hyperparameter_grid``.
-        * Prints the best hyper‑parameters and cross‑validation statistics.
+        * Prints the best hyper-parameters and cross-validation statistics.
         * Saves the best estimator to ``best_model.joblib`` and, if available,
           writes feature importances to ``feature_importances.csv``.
         """
@@ -350,12 +352,12 @@ class ModelSelectionAgent:
         # Voting ensemble
         lines.append(f"voting_estimator = {voting_class}(estimators=[{voting_dict_str}], voting='soft' if '{voting_class}' == 'VotingClassifier' else 'hard')")
         lines.append("")
-        # Cross‑validation evaluation
+        # Cross-validation evaluation
         lines.append(f"cv = {cv_obj}")
         lines.append(f"scores = cross_val_score(voting_estimator, X, y, cv=cv, scoring='{scoring}')")
-        lines.append("print(f'Cross‑val {scoring}: {np.mean(scores):.4f} ± {np.std(scores):.4f}')")
+        lines.append("print(f'Cross-val {scoring}: {np.mean(scores):.4f} ± {np.std(scores):.4f}')")
         lines.append("")
-        # Fit primary model (with hyper‑parameter search) and then ensemble
+        # Fit primary model (with hyper-parameter search) and then ensemble
         lines.append("primary_estimator.fit(X, y)")
         lines.append("best_model = primary_estimator.best_estimator_ if hasattr(primary_estimator, 'best_estimator_') else primary_estimator")
         lines.append("voting_estimator.fit(X, y)")
@@ -437,6 +439,18 @@ class ModelSelectionAgent:
         Returns a dict mapping model name to its tuning result.
         """
         tuning_results = {}
+        models_to_tune = selection.get("recommended_models", [])
+
+        # Guard: if no models or no target, return meaningful fallback
+        if not models_to_tune or y is None:
+            logger.warning("[ModelSelection] No models to tune or target missing")
+            return {
+                "best_overall_model": None,
+                "best_overall_score": 0.0,
+                "_skipped": True,
+                "_reason": "no_models_or_no_target"
+            }
+
         # Define simple default search spaces mirroring previous static grids
         default_spaces = {
             "RandomForestClassifier": {"n_estimators": {"type": "int", "low": 50, "high": 300}, "max_depth": {"type": "int", "low": 5, "high": 30}},
@@ -446,13 +460,30 @@ class ModelSelectionAgent:
             "Ridge": {"alpha": {"type": "float", "low": 0.1, "high": 100.0}},
             "GradientBoostingRegressor": {"n_estimators": {"type": "int", "low": 50, "high": 300}, "learning_rate": {"type": "float", "low": 0.01, "high": 0.2}, "max_depth": {"type": "int", "low": 3, "high": 10}},
         }
-        models_to_tune = [selection["primary_model"]] + selection.get("ensemble_models", [])
+
+        from multimodal_ds.agents.model_agents import get_model_agent
+        
+        target_col = y.name if hasattr(y, 'name') and y.name else "target"
+        feature_cols = X.columns.tolist() if hasattr(X, 'columns') else []
+        task_type = "classification" if "Classifier" in selection.get("primary_model", "") else "regression"
+
         for mdl in models_to_tune:
             space = default_spaces.get(mdl, {})
             if not space:
                 continue
             result = self.tune_model(mdl, X, y, selection.get("cv_strategy", "kfold"), selection.get("scoring_metric", "r2"), space, n_trials=n_trials)
             tuning_results[mdl] = result
+            
+            # Generate model-specific training code
+            model_agent = get_model_agent(mdl, self.session_id)
+            code = model_agent.generate_training_code(
+                target_col=target_col,
+                feature_cols=feature_cols,
+                task_type=task_type,
+                best_params=result.get("best_params", {}),
+            )
+            tuning_results[mdl]["generated_code"] = code
+
         # Determine best overall model
         best_overall_model = None
         best_overall_score = float('-inf')
@@ -465,6 +496,26 @@ class ModelSelectionAgent:
         tuning_results['best_overall_model'] = best_overall_model
         tuning_results['best_overall_score'] = best_overall_score
 
+        # Persist results in SharedContextPool
+        self.pool.set("tuning_results", tuning_results, agent="model_selection_agent")
+        self.pool.set("best_model", best_overall_model, agent="model_selection_agent")
+
+        # Broadcast STATS_COMPLETE via MessageBus
+        from multimodal_ds.core.message_bus import AgentMessage, MessageType, get_bus
+        bus = get_bus()
+        bus.publish(AgentMessage(
+            msg_type=MessageType.STATS_COMPLETE,
+            sender="model_selection_agent",
+            session_id=self.session_id,
+            payload={
+                "best_model": best_overall_model,
+                "best_score": best_overall_score,
+                "models_tuned": len(tuning_results) - 2  # Excluding the summary keys
+            }
+        ))
+
+        return tuning_results
+
     def generate_tuned_ensemble_code(
             self,
             selection: Dict[str, Any],
@@ -472,7 +523,7 @@ class ModelSelectionAgent:
             df_varname: str = "df",
             target_col: str = "target",
         ) -> str:
-        """Generate Python script using tuned hyper‑parameters for the primary model.
+        """Generate Python script using tuned hyper-parameters for the primary model.
         """
         primary = selection["primary_model"]
         ensemble = selection.get("ensemble_models", [])
@@ -529,7 +580,7 @@ class ModelSelectionAgent:
             cv_obj = "KFold(n_splits=5, shuffle=True, random_state=42)"
         lines.append(f"cv = {cv_obj}")
         lines.append(f"scores = cross_val_score(voting_estimator, X, y, cv=cv, scoring='{scoring}')")
-        lines.append("print(f'Cross‑val {scoring}: {np.mean(scores):.4f} ± {np.std(scores):.4f}')")
+        lines.append("print(f'Cross-val {scoring}: {np.mean(scores):.4f} ± {np.std(scores):.4f}')")
         lines.append("")
         # Fit models
         lines.append("primary_estimator.fit(X, y)")

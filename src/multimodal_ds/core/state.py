@@ -7,7 +7,7 @@ class AgentState(TypedDict):
     user_query: str
     uploaded_files: List[str]
     _routing_flags: Dict[str, bool]
-    parsed_documents: List[Dict]
+    parsed_documents: Annotated[List[Dict], operator.add]
     image_embeddings: Annotated[List[Any], operator.add]
     audio_transcripts: Annotated[List[str], operator.add]
     tabular_summaries: Annotated[List[Dict], operator.add]
@@ -42,3 +42,5 @@ class AgentState(TypedDict):
     reflection_report: Dict[str, Any]
     executive_summary: str
     business_recommendations: List[str]
+    reflection_output: Dict[str, Any]
+    step_failures: Dict[str, int]

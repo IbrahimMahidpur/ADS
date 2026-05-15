@@ -106,11 +106,21 @@ class CodeExecutionAgent:
         rag_context = self._retrieve_rag_context(task_description)
         if rag_context:
             data_context = f"Relevant document context (from ChromaDB):\n{rag_context}\n\n" + data_context
+            
+        exclude_keywords = []
+        task_lower = task_description.lower()
+        if any(w in task_lower for w in ["visual", "plot", "chart", "graph"]):
+            exclude_keywords.extend(["stat_", "normality", "correlation", "tuning", "optuna"])
+        elif any(w in task_lower for w in ["model", "train", "predict"]):
+            exclude_keywords.extend(["chart", "plot", "html"])
+            
         from multimodal_ds.core.context_pool import get_context_pool
         pool = get_context_pool(self.session_id)
-        pool_summary = pool.get_summary()
+        
+        pool_summary = pool.get_summary(max_chars=800, exclude_keywords=exclude_keywords)
         if pool_summary and pool_summary != "No shared context yet.":
             data_context = f"Shared session context from other agents:\n{pool_summary}\n\n" + data_context
+            
         task = {"name": task_description[:80], "description": task_description}
         return self.execute_task(task=task, data_context=data_context, file_paths=file_paths, max_retries=max_retries)
 
@@ -161,13 +171,18 @@ class CodeExecutionAgent:
         constraints = self._inject_statistical_constraints(constraints)
         constraint_section = "\n".join(constraints) + ("\n\n" if constraints else "")
         prompt = f"""Task: {task_desc}\nData Context:\n{data_context[:1500]}\nPrevious Context:\n{past_context[:500]}\n{constraint_section}Working directory: {self.working_dir}\nWrite Python code. Save all outputs to the current directory."""
-        # Pull cross-session lessons
-        from multimodal_ds.agents.reflection_agent import ReflectionAgent
-        reflect = ReflectionAgent(session_id=self.session_id)
-        past_lessons = reflect.get_lessons_for_task(task_desc)
-        if past_lessons:
-            prompt = past_lessons + "\n\n" + prompt
-            logger.info(f"[CodeAgent] Injected {len(past_lessons.splitlines())} past lessons into prompt")
+        # Retrieve relevant past lessons from AgentMemory
+        try:
+            from multimodal_ds.memory.agent_memory import AgentMemory
+            mem = AgentMemory(collection_name="doc_chunks")
+            lesson_results = mem.retrieve(task_desc, n_results=3)
+            if lesson_results:
+                lesson_text = "\n".join(r.get("content", "") for r in lesson_results if r.get("content"))
+                if lesson_text:
+                    prompt = f"Relevant past lessons:\n{lesson_text}\n\n" + prompt
+                    logger.info(f"[CodeAgent] Injected {len(lesson_results)} past lessons into prompt")
+        except Exception as e:
+            logger.debug(f"[CodeAgent] Lesson retrieval skipped: {e}")
         model = CODE_GEN_MODEL.replace("ollama/", "")
         try:
             response = httpx.post(

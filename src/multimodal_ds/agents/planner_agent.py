@@ -27,12 +27,41 @@ def _needs_web_search(objective: str) -> bool:
     pattern = re.compile(r"|".join(keywords), re.IGNORECASE)
     return bool(pattern.search(objective))
 
-def _perform_web_search(objective: str) -> str:
-    """Placeholder for actual WebSearch tool call.
-    Returns an empty string; in production this would invoke the Claude Code
-    WebSearch tool and return relevant snippets.
+def _attempt_web_search(objective: str, session_id: str = "default") -> str:
+    """Attempt a web search with multiple fallbacks.
+    Returns the search context or an empty string if unavailable.
     """
-    # TODO: integrate with the WebSearch tool when running under Claude Code.
+    import os
+    import httpx
+    
+    # First fallback: Check Claude Code availability
+    if os.getenv("CLAUDE_CODE_AVAILABLE") or os.getenv("CLAUDE_CODE"):
+        # Real integration would go here
+        pass
+
+    # Second fallback: DuckDuckGo instant answer API
+    try:
+        r = httpx.get("https://api.duckduckgo.com/",
+                      params={"q": objective[:200], "format": "json", "no_html": 1},
+                      timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            abstract = data.get("AbstractText", "")
+            if abstract:
+                return f"Web context: {abstract[:500]}"
+    except Exception as e:
+        logger.warning(f"[Planner] DuckDuckGo fallback failed: {e}")
+
+    # Third fallback: Log warning and set context pool flag
+    logger.warning("[Planner] Web search was requested but is unavailable.")
+    try:
+        from multimodal_ds.core.context_pool import get_context_pool
+        pool = get_context_pool(session_id)
+        pool.set("web_search_requested", True, agent="planner")
+        pool.set("web_search_available", False, agent="planner")
+    except Exception as e:
+        logger.warning(f"[Planner] Failed to set context pool flags: {e}")
+        
     return ""
 
 import operator
@@ -97,6 +126,7 @@ class PlannerState(TypedDict):
     final_plan: str
     model_selection: dict
     ensemble_code_template: str
+    web_results: str
 
 
 def _call_ollama(prompt: str, system: str = "", max_tokens: int = 4000) -> str:
@@ -171,11 +201,11 @@ def decompose_into_tasks(state: PlannerState) -> PlannerState:
     if len(profiles_text) > 8000:
         profiles_text = profiles_text[:8000] + "\n... [truncated for length] ..."
 
-            # Inject model selection context if available
-        model_context = ""
-        if state.get("model_selection"):
-            ms = state["model_selection"]
-            model_context = f"""
+    # Inject model selection context if available
+    model_context = ""
+    if state.get("model_selection"):
+        ms = state["model_selection"]
+        model_context = f"""
 Model Selection (already determined by statistical analysis):
 - Primary model: {ms.get('primary_model')}
 - Ensemble: {ms.get('ensemble_models')}
@@ -188,11 +218,16 @@ IMPORTANT: Your modeling task MUST use these specific models, not invent new one
 If an ensemble_code_template is available in context, use it as the basis for the modeling step.
 """
 
-        # If the objective hints at external references, perform a (placeholder) web search and include results
     web_results = ""
+    web_note = ""
     if _needs_web_search(state["user_objective"]):
-        web_results = _perform_web_search(state["user_objective"])
+        web_results = _attempt_web_search(state["user_objective"], state.get("session_id", "default"))
         state["web_results"] = web_results
+        
+        if not web_results:
+            web_note = "\n[Note: web search was requested but unavailable — plan based on data only]\n"
+        else:
+            web_note = f"\nExternal web context (retrieved):\n{web_results}\n"
 
     prompt = f"""You are a senior data scientist creating an analysis plan.
 
@@ -200,9 +235,7 @@ STRICT RULE: Use ONLY the exact column names found in the 'Data available' secti
 Do NOT hallucinate or guess column names.
 
 Objective: {state['user_objective']}
-
-{('Web context:\n' + web_results) if web_results else ''}
-
+{web_note}
 Hypotheses to test:
 {hypotheses_text}
 

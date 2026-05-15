@@ -1,5 +1,5 @@
 """
-MessageBus — thread-safe pub/sub event system for inter-agent communication.
+MessageBus - thread-safe pub/sub event system for inter-agent communication.
 
 Design:
   - Singleton pattern via get_bus() / reset_bus()
@@ -10,13 +10,13 @@ Design:
   - publish_and_wait() for synchronous request/reply patterns
 
 MessageType taxonomy:
-  INGEST_*   — ingestion pipeline events
-  PLAN_*     — planner agent events
-  CODE_*     — code execution agent events
-  STATS_*    — statistical agent events
-  VIZ_*      — visualization agent events
-  EVAL_*     — evaluation agent events
-  SESSION_*  — session lifecycle events
+  INGEST_*   - ingestion pipeline events
+  PLAN_*     - planner agent events
+  CODE_*     - code execution agent events
+  STATS_*    - statistical agent events
+  VIZ_*      - visualization agent events
+  EVAL_*     - evaluation agent events
+  SESSION_*  - session lifecycle events
   HANDOFF    — agent-to-agent task handoff
 
 Thread safety:
@@ -355,7 +355,7 @@ class MessageBus:
                     self._stats["dlq"] += 1
                     logger.debug(
                         f"[Bus] No subscribers for {current.msg_type.value} "
-                        f"— sent to DLQ"
+                        f"- sent to DLQ"
                     )
                 return False
 

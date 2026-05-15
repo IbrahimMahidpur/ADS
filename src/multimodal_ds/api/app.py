@@ -10,17 +10,26 @@ Endpoints:
   GET  /health          — Liveness check
   GET  /docs            — Auto-generated Swagger UI (built-in)
 """
+import asyncio
 import logging
 import shutil
 import tempfile
+import time
 import uuid
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
+
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.interval import IntervalTrigger
 
 from multimodal_ds.config import OUTPUT_DIR, LOG_LEVEL, API_HOST, API_PORT
 from multimodal_ds.ingestion.router import route_and_ingest
@@ -37,6 +46,34 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ── App ────────────────────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    scheduler = BackgroundScheduler()
+    
+    def cleanup_old_sessions():
+        logger.info("Running background cleanup for old sessions...")
+        now = time.time()
+        count = 0
+        if OUTPUT_DIR.exists():
+            for session_dir in OUTPUT_DIR.iterdir():
+                if session_dir.is_dir():
+                    mtime = session_dir.stat().st_mtime
+                    if now - mtime > 86400: # 24 hours
+                        try:
+                            shutil.rmtree(session_dir)
+                            count += 1
+                        except Exception as e:
+                            logger.error(f"Failed to delete {session_dir}: {e}")
+        if count > 0:
+            logger.info(f"Cleanup finished. Deleted {count} session directories.")
+
+    # Run cleanup every 6 hours
+    scheduler.add_job(cleanup_old_sessions, trigger=IntervalTrigger(hours=6))
+    scheduler.start()
+    yield
+    scheduler.shutdown()
+
 app = FastAPI(
     title="Multimodal Agentic DS Engine",
     description=(
@@ -47,7 +84,12 @@ app = FastAPI(
     version="1.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
+    lifespan=lifespan,
 )
+
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
@@ -139,7 +181,8 @@ def health_check():
 
 
 @app.post("/ingest", response_model=IngestResponse, tags=["Ingestion"])
-async def ingest_file(file: UploadFile = File(...)):
+@limiter.limit("20/minute")
+async def ingest_file(request: Request, file: UploadFile = File(...)):
     """
     Upload any supported file and ingest it through the appropriate pipeline.
 
@@ -184,7 +227,9 @@ async def ingest_file(file: UploadFile = File(...)):
 
 
 @app.post("/analyse", response_model=AnalyseResponse, tags=["Analysis"])
+@limiter.limit("5/minute")
 async def analyse(
+    request: Request,
     files: list[UploadFile] = File(...),
     objective: str = Form(...),
     session_id: Optional[str] = Form(None),
@@ -226,7 +271,13 @@ async def analyse(
         )
         
         logger.info(f"[API] Starting LangGraph run for session {session_id}")
-        result = graph.invoke(initial_state, config=config)
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(graph.invoke, initial_state, config=config),
+                timeout=600.0  # 10 minutes max
+            )
+        except asyncio.TimeoutError:
+            raise HTTPException(status_code=504, detail="Analysis timed out after 10 minutes")
         
         return AnalyseResponse(
             session_id=session_id,
@@ -290,7 +341,9 @@ async def generate_plan(
 
 
 @app.post("/visualize", response_model=VisualizeResponse, tags=["Analysis"])
+@limiter.limit("5/minute")
 async def visualize(
+    request: Request,
     files: list[UploadFile] = File(...),
     target_col: Optional[str] = Form(None),
     session_id: Optional[str] = Form(None),
