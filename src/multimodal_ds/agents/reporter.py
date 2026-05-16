@@ -73,7 +73,7 @@ def _call_ollama(prompt: str, system: str = REPORTER_SYSTEM) -> str:
                 "stream": False,
                 "options": {"num_predict": 4000, "temperature": 0.2},
             },
-            timeout=LLM_TIMEOUT,
+            timeout=httpx.Timeout(connect=5.0, read=LLM_TIMEOUT, write=LLM_TIMEOUT, pool=5.0),
         )
         if response.status_code == 200:
             return response.json().get("message", {}).get("content", "")
@@ -167,6 +167,26 @@ Errors encountered:
 Write the complete analysis report now. Be sure to mention any saved models or data files in the Results or Recommendations section."""
 
     report = _call_ollama(prompt)
+
+    # Write final report to disk
+    from pathlib import Path
+    from multimodal_ds.config import OUTPUT_DIR
+    session_dir = Path(OUTPUT_DIR) / session_id
+    session_dir.mkdir(parents=True, exist_ok=True)
+    final_report_path = session_dir / "final_report.md"
+    try:
+        final_report_path.write_text(report, encoding="utf-8")
+        logger.info(f"[Reporter] Saved final report to {final_report_path}")
+    except Exception as e:
+        logger.warning(f"[Reporter] Failed to write final report to disk: {e}")
+
+    # Write eval report to disk as well
+    eval_report_path = session_dir / "eval_report.json"
+    try:
+        import json
+        eval_report_path.write_text(json.dumps(eval_report, indent=2, default=str), encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"[Reporter] Failed to write eval report to disk: {e}")
 
     # ── Delegate to ReportGeneratorAgent ──────────────────────────────────
     executive_summary       = ""

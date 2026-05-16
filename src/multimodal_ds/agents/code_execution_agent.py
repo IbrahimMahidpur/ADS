@@ -11,6 +11,8 @@ import time
 from pathlib import Path
 from typing import Optional
 
+import httpx
+
 from multimodal_ds.config import CODE_GEN_MODEL, CODE_FIX_MODEL, OLLAMA_BASE_URL, LLM_TIMEOUT, OUTPUT_DIR
 from multimodal_ds.memory.agent_memory import AgentMemory
 from multimodal_ds.core.observability import agent_span, get_session_tracker
@@ -23,6 +25,13 @@ _STDOUT_CHARS   = int(os.getenv("SANDBOX_STDOUT_CHARS", "8000"))
 _PROC_TIMEOUT_S = int(os.getenv("SANDBOX_TIMEOUT_S",    "300"))
 
 SYSTEM_PROMPT = """You are a senior data scientist with 50+ years of production ML experience.
+
+CRITICAL DATA PREPROCESSING (MUST DO BEFORE ANY MODELING):
+1. Drop ID columns like 'CustomerID', 'id', 'ID' - never use them as features
+2. Identify categorical columns: columns with dtype 'object' that are NOT the target
+3. Encode categorical features using: from sklearn.preprocessing import LabelEncoder OR pd.get_dummies()
+4. Encode target variable if it's string (e.g., 'Yes'/'No' -> 1/0): df['target'] = df['target'].map({'Yes': 1, 'No': 0})
+5. Convert all features to numeric: use LabelEncoder for single columns, get_dummies for multiple
 
 BEFORE writing any code, you MUST:
 1. Print df.columns.tolist() and df.shape — NEVER assume column names
@@ -48,6 +57,7 @@ ERROR HANDLING:
 - Wrap all file operations in try/except
 - Print the actual error message, do not silently pass
 - If a column is missing, print available columns and stop gracefully
+- For string formatting with potential strings, convert to numeric first
 
 Output ONLY valid Python code inside ```python ... ``` fences. No commentary outside."""
 
@@ -188,7 +198,7 @@ class CodeExecutionAgent:
             response = httpx.post(
                 f"{OLLAMA_BASE_URL}/api/chat",
                 json={"model": model, "messages": [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}], "stream": False, "options": {"num_predict": 4000, "temperature": 0.1}},
-                timeout=LLM_TIMEOUT,
+                timeout=httpx.Timeout(connect=5.0, read=LLM_TIMEOUT, write=LLM_TIMEOUT, pool=5.0),
             )
             if response.status_code == 200:
                 content = response.json().get("message", {}).get("content", "")
@@ -279,7 +289,7 @@ class CodeExecutionAgent:
             response = httpx.post(
                 f"{OLLAMA_BASE_URL}/api/chat",
                 json={"model": model, "messages": [{"role": "system", "content": "Fix Python code. Output only the fixed code in ```python``` fences."}, {"role": "user", "content": prompt}], "stream": False, "options": {"num_predict": 2000, "temperature": 0.1}},
-                timeout=LLM_TIMEOUT,
+                timeout=httpx.Timeout(connect=5.0, read=LLM_TIMEOUT, write=LLM_TIMEOUT, pool=5.0),
             )
             if response.status_code == 200:
                 return self._extract_code(response.json().get("message", {}).get("content", ""))

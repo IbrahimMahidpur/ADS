@@ -148,7 +148,9 @@ class StatisticalReasoningAgent:
                     numeric_df = numeric_df.drop(columns=[target_col])
                 # Drop rows with any NA to avoid errors in VIF calculation
                 clean_df = numeric_df.dropna()
-                if clean_df.shape[1] == 0:
+                # Drop constant columns — VIF is undefined for them (causes inf/nan)
+                clean_df = clean_df.loc[:, clean_df.std() > 0]
+                if clean_df.shape[1] < 2:
                     return {}
                 X = clean_df.values
                 from statsmodels.stats.outliers_influence import variance_inflation_factor

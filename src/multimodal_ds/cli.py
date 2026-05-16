@@ -138,20 +138,35 @@ def run(
             # Use stream() to show progress through the graph nodes
             for event in graph.stream(initial_state, config=config, stream_mode="updates"):
                 for node_name, state_update in event.items():
-                    console.print(f"[blue]» Finished node:[/] [bold]{node_name}[/]")
+                    try:
+                        console.print(f"[blue]» Finished node:[/] [bold]{node_name}[/]")
+                    except Exception:
+                        print(f"» Finished node: {node_name}")
                     final_state = _merge_state(final_state, state_update)
-                    
+
                     # Provide specific updates based on node
                     if node_name == "planner":
                         n_tasks = len(state_update.get("analysis_tasks", []))
-                        console.print(f"   [green]✔[/] Created plan with {n_tasks} tasks.")
+                        try:
+                            console.print(f"   [green]OK[/] Created plan with {n_tasks} tasks.")
+                        except Exception:
+                            print(f"   OK: Created plan with {n_tasks} tasks.")
                     elif node_name == "executor":
                         step = state_update.get("current_step", 0)
-                        console.print(f"   [green]✔[/] Executed task step {step}.")
+                        try:
+                            console.print(f"   [green]OK[/] Executed task step {step}.")
+                        except Exception:
+                            print(f"   OK: Executed task step {step}.")
                     elif node_name == "stats_val":
-                        console.print(f"   [green]✔[/] Statistical validation complete.")
-                    
-                    status.update(f"Executing: {node_name}...")
+                        try:
+                            console.print(f"   [green]OK[/] Statistical validation complete.")
+                        except Exception:
+                            print("   OK: Statistical validation complete.")
+
+                    try:
+                        status.update(f"Executing: {node_name}...")
+                    except Exception:
+                        pass
         except Exception as e:
             console.print(f"[bold red]Graph execution failed:[/] {e}")
             import traceback

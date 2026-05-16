@@ -263,7 +263,7 @@ class ReflectionAgent:
                     "stream":  False,
                     "options": {"temperature": 0.1, "num_predict": 400},
                 },
-                timeout=LLM_TIMEOUT,
+                timeout=httpx.Timeout(connect=5.0, read=LLM_TIMEOUT, write=LLM_TIMEOUT, pool=5.0),
             )
             if response.status_code != 200:
                 logger.warning(

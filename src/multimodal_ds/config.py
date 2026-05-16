@@ -36,7 +36,8 @@ CODER_MODEL     = os.getenv("CODER_MODEL",    "ollama/qwen2.5:7b")
 REVIEWER_MODEL  = os.getenv("REVIEWER_MODEL", "ollama/qwen2.5:7b")
 VISION_MODEL    = os.getenv("VISION_MODEL",   "ollama/llava:7b")
 MAX_ITERATIONS = int(os.getenv("MAX_ITERATIONS", "10"))
-LLM_TIMEOUT    = int(os.getenv("LLM_TIMEOUT",    "600"))
+LLM_TIMEOUT    = int(os.getenv("LLM_TIMEOUT",    "60"))
+PLANNER_TIMEOUT = int(os.getenv("PLANNER_TIMEOUT", "45"))
 LLM_RETRIES    = int(os.getenv("LLM_RETRIES",    "1"))
 ENABLE_PII     = os.getenv("ENABLE_PII_DETECTION", "true").lower() == "true"
 

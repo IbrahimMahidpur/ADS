@@ -391,6 +391,13 @@ class ModelSelectionAgent:
 
         Returns a dictionary with best_params, best_value and the Optuna study.
         """
+        global optuna
+        if optuna is None:
+            try:
+                import optuna
+            except ImportError:
+                return {"best_params": {}, "best_value": 0.0, "study": None, "_skipped": True, "_reason": "optuna_not_installed"}
+
         from sklearn.model_selection import StratifiedKFold, KFold, cross_val_score
         import importlib
 
@@ -404,6 +411,10 @@ class ModelSelectionAgent:
                 module = importlib.import_module('sklearn.linear_model')
             elif name in {"SVC", "SVR"}:
                 module = importlib.import_module('sklearn.svm')
+            elif name in {"XGBClassifier", "XGBRegressor"}:
+                module = importlib.import_module('xgboost')
+            elif name in {"LGBMClassifier", "LGBMRegressor"}:
+                module = importlib.import_module('lightgbm')
             else:
                 raise ValueError(f"Unsupported model {name}")
             return getattr(module, name)
@@ -450,6 +461,20 @@ class ModelSelectionAgent:
                 "_skipped": True,
                 "_reason": "no_models_or_no_target"
             }
+
+        # Check if optuna is available
+        global optuna
+        if optuna is None:
+            try:
+                import optuna
+            except ImportError:
+                logger.warning("[ModelSelection] Optuna not installed - skipping hyperparameter tuning")
+                return {
+                    "best_overall_model": None,
+                    "best_overall_score": 0.0,
+                    "_skipped": True,
+                    "_reason": "optuna_not_installed"
+                }
 
         # Define simple default search spaces mirroring previous static grids
         default_spaces = {

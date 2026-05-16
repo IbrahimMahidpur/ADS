@@ -636,7 +636,7 @@ class VisualizationAgent:
                     "stream":   False,
                     "options":  {"num_predict": 150, "temperature": 0.2},
                 },
-                timeout=LLM_TIMEOUT,
+                timeout=httpx.Timeout(connect=5.0, read=LLM_TIMEOUT, write=LLM_TIMEOUT, pool=5.0),
             )
             if response.status_code == 200:
                 content = response.json().get("message", {}).get("content", "").strip()

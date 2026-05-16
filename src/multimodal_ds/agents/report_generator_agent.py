@@ -316,7 +316,7 @@ class ReportGeneratorAgent:
                     "stream": False,
                     "options": {"num_predict": 2000, "temperature": 0.2},
                 },
-                timeout=LLM_TIMEOUT,
+                timeout=httpx.Timeout(connect=5.0, read=LLM_TIMEOUT, write=LLM_TIMEOUT, pool=5.0),
             )
             if resp.status_code == 200:
                 content = resp.json().get("message", {}).get("content", "")

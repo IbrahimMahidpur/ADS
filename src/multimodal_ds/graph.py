@@ -98,7 +98,7 @@ def _decide_ingestion_path(state) -> list[Send]:
 def _ingest_merge_node(state):
     """Merge ingestion results, perform blocked document checks, and sanitize state."""
     from multimodal_ds.core.message_bus import get_bus, AgentMessage, MessageType
-    from multimodal_ds.core.context_pool import SharedContextPool
+    from multimodal_ds.core.context_pool import get_context_pool
     import logging
     
     logger = logging.getLogger(__name__)
@@ -137,17 +137,17 @@ def _ingest_merge_node(state):
             
     state["errors"] = errors
             
-    # 3. Build a data_context_summary string from non-blocked tabular summaries
-    tabular_summaries = []
-    for d in parsed_documents:
-        if d.get("status") != "blocked":
-            summary = d.get("metadata", {}).get("tabular_summary")
-            if summary:
-                tabular_summaries.append(str(summary))
-                
-    if tabular_summaries:
-        summary_text = "\n".join(tabular_summaries)
-        pool = SharedContextPool()
+    # 3. Build a data_context_summary string from tabular_summaries
+    # (not parsed_documents - those come from doc/img/audio ingest, not tab_ingest)
+    tabular_summaries_list = []
+    for t in state.get("tabular_summaries", []):
+        summary = t.get("sample", "")
+        if summary:
+            tabular_summaries_list.append(str(summary))
+
+    if tabular_summaries_list:
+        summary_text = "\n".join(tabular_summaries_list)
+        pool = get_context_pool(session_id)
         pool.set("ingest_summary", summary_text, agent="ingest_merge")
 
     # 4. Return the updated state with the new errors appended
@@ -229,12 +229,13 @@ def _tab_ingest_node(state):
             doc = ingest_tabular(fp)
             if doc.schema_info:
                 summaries.append({
-                    "source":       fp,
-                    "shape":        doc.schema_info.get("shape", []),
-                    "columns":      doc.schema_info.get("columns", []),
-                    "dtypes":       doc.schema_info.get("dtypes", {}),
-                    "sample":       doc.text_content[:1500],
-                    "data_profile": doc.data_profile,
+                    "source":            fp,
+                    "shape":             doc.schema_info.get("shape", []),
+                    "columns":           doc.schema_info.get("columns", []),
+                    "dtypes":            doc.schema_info.get("dtypes", {}),
+                    "sample":            doc.text_content[:1500],
+                    "data_profile":      doc.data_profile,
+                    "automl_suggestion": doc.metadata.get("automl_suggestion", {}),
                 })
     return {"tabular_summaries": _sanitize_for_checkpoint(summaries)}
 
@@ -271,7 +272,8 @@ def _model_selection_node(state):
             return {}
 
         automl_suggestion = first.get("automl_suggestion", {})
-        target_col = automl_suggestion.get("target_candidates", [None])[0]
+        candidates = automl_suggestion.get("target_candidates", [])
+        target_col = candidates[0] if candidates else df.columns[-1]
         stat_report = state.get("statistical_report", {})
 
         agent = ModelSelectionAgent(session_id=state.get("session_id", "default"))
@@ -452,6 +454,10 @@ def _planner_node(state):
         plan_result = {}
 
     tasks = plan_result.get("analysis_plan", [])
+    if not tasks:
+        logger.warning("[Planner] No tasks generated - using default plan")
+        from multimodal_ds.agents.planner_agent import _default_plan
+        tasks = _default_plan(state.get("tabular_summaries", []))
     return {
         "analysis_plan":  plan_result.get("final_plan", ""),
         "analysis_tasks": tasks,
@@ -577,6 +583,9 @@ def _executor_node(state):
     error_str: str = result.get("error", "")
 
     # ── 6. PII scan on generated files ───────────────────────────────────────
+    # Only scan narrative files (.txt, .html, .md) - never scan generated CSVs
+    # or model outputs which trigger false positives (e.g., integer-coded survey
+    # data or surname columns misidentified as PERSON entities by Presidio).
     guard = get_pii_guard()
     pii_blocked_files = []
     pii_clean_files = []
@@ -586,7 +595,7 @@ def _executor_node(state):
             if not fpath.exists():
                 pii_clean_files.append(fname)
                 continue
-            if fpath.suffix.lower() in {".txt", ".csv", ".json", ".html", ".md"}:
+            if fpath.suffix.lower() in {".txt", ".html", ".md"}:
                 content = fpath.read_text(encoding="utf-8", errors="ignore")
                 report = guard.scan_text(content, source=fname)
                 if report.blocked:
@@ -595,6 +604,7 @@ def _executor_node(state):
                 else:
                     pii_clean_files.append(fname)
             else:
+                # CSVs, JSON, images, model artifacts go directly to clean list
                 pii_clean_files.append(fname)
         except Exception as pii_err:
             logger.warning(f"[Executor] PII scan failed for '{fname}': {pii_err} - passing file")
@@ -711,15 +721,29 @@ def _reflection_node(state):
         logger.info(f"[Reflection] Starting diagnosis. Retry attempt {retry_count + 1}/{MAX_RETRIES}")
 
         # 2. Check verdict - if PASS, we don't need to reflect or retry
-        eval_report_raw = state.get("eval_report", {})
-        if not isinstance(eval_report_raw, dict):
-            eval_report_dict = eval_report_raw.to_dict() if hasattr(eval_report_raw, "to_dict") else {}
-        else:
-            eval_report_dict = eval_report_raw
+        # First check quality gate result (set by quality_gate, not reviewer)
+        gate_passed = state.get("gate_passed", True)
+        eval_report_dict = {}
+        if gate_passed:
+            # Quality gate passed - check if reviewer also passed
+            eval_report_raw = state.get("eval_report", {})
+            if not isinstance(eval_report_raw, dict):
+                eval_report_dict = eval_report_raw.to_dict() if hasattr(eval_report_raw, "to_dict") else {}
+            else:
+                eval_report_dict = eval_report_raw
 
-        if eval_report_dict.get("session_verdict") == "PASS":
-            logger.info("[Reflection] Verdict is PASS. Skipping reflection.")
-            return {}
+            if eval_report_dict.get("session_verdict") == "PASS":
+                logger.info("[Reflection] Verdict is PASS. Skipping reflection.")
+                return {}
+        else:
+            # Quality gate failed - need to reflect and retry
+            logger.info("[Reflection] Quality gate failed - proceeding with diagnosis")
+            # Get eval_report for context even when gate failed
+            eval_report_raw = state.get("eval_report", {})
+            if not isinstance(eval_report_raw, dict):
+                eval_report_dict = eval_report_raw.to_dict() if hasattr(eval_report_raw, "to_dict") else {}
+            else:
+                eval_report_dict = eval_report_raw
 
         # 3. Call the real ReflectionAgent API
         agent = ReflectionAgent(session_id=session_id, max_retries=MAX_RETRIES)
@@ -878,8 +902,9 @@ def _quality_gate_node(state):
     if not last_success:
         gate_passed = False
         gate_reasons.append("Execution returned non-zero exit code")
-    # 2. Output length
-    if len(last_output.strip()) < 20:
+    # 2. Output length - lowered from 20 to 5 since short output like
+    # print(df.head()) on failed import isn't a crash
+    if len(last_output.strip()) < 5:
         gate_passed = False
         gate_reasons.append("Output too short - likely crashed silently")
     # 3. Expected artifact files for modeling/evaluation
@@ -963,6 +988,10 @@ def _decide_after_gate(state: dict) -> str:
     current_step = state.get("current_step", 0)
     steps_total = state.get("steps_total", 0)
     retry_count = state.get("retry_count", 0)
+
+    # Guard: No tasks planned - go directly to reporter
+    if steps_total == 0:
+        return "reporter"
 
     # 1. Happy path: Success and more tasks remain
     if gate_passed and current_step < steps_total:
@@ -1186,6 +1215,7 @@ def make_initial_state(
         "messages":           [],
         "_last_task_name":    "",
         "_last_files_created": [],
+        "_last_success":      True,  # Initialize as success for first run
         "current_step_files": [],
         "current_step_success": False,
         "_files_per_step": [],

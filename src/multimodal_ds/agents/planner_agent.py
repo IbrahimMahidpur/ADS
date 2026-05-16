@@ -65,8 +65,9 @@ def _attempt_web_search(objective: str, session_id: str = "default") -> str:
     return ""
 
 import operator
+import httpx
 
-from multimodal_ds.config import HYPOTHESIS_MODEL, PLANNER_MODEL, OLLAMA_BASE_URL, LLM_TIMEOUT
+from multimodal_ds.config import HYPOTHESIS_MODEL, PLANNER_MODEL, OLLAMA_BASE_URL, LLM_TIMEOUT, PLANNER_TIMEOUT
 from multimodal_ds.memory.agent_memory import AgentMemory
 from multimodal_ds.core.schema import UnifiedDocument
 
@@ -129,10 +130,11 @@ class PlannerState(TypedDict):
     web_results: str
 
 
-def _call_ollama(prompt: str, system: str = "", max_tokens: int = 4000) -> str:
+def _call_ollama(prompt: str, system: str = "", max_tokens: int = 4000, timeout: int = None) -> str:
     """Call Ollama with a prompt and return response text."""
     import httpx
     model = PLANNER_MODEL.replace("ollama/", "")
+    read_timeout = timeout if timeout is not None else PLANNER_TIMEOUT
     try:
         messages = []
         if system:
@@ -147,7 +149,7 @@ def _call_ollama(prompt: str, system: str = "", max_tokens: int = 4000) -> str:
                 "stream": False,
                 "options": {"num_predict": max_tokens, "temperature": 0.3},
             },
-            timeout=LLM_TIMEOUT,
+            timeout=httpx.Timeout(connect=5.0, read=read_timeout, write=read_timeout, pool=5.0),
         )
         if response.status_code == 200:
             return response.json().get("message", {}).get("content", "")
@@ -195,11 +197,21 @@ Respond ONLY with valid JSON array, no other text."""
 
 
 def decompose_into_tasks(state: PlannerState) -> PlannerState:
-    """Node: Decompose objective into ordered analysis tasks."""
-    hypotheses_text = "\n".join(f"- {h}" for h in state.get("hypotheses", []))
+    """Node: Decompose objective into ordered analysis tasks (including hypothesis generation in single call)."""
+    hypotheses = state.get("hypotheses", [])
     profiles_text = json.dumps(state["data_profiles"], indent=2)
     if len(profiles_text) > 8000:
         profiles_text = profiles_text[:8000] + "\n... [truncated for length] ..."
+
+    # If no hypotheses provided, generate them as part of this call
+    if not hypotheses:
+        hypotheses_section = """First, generate 3-5 specific, testable hypotheses based on the data and objective.
+Then create the analysis plan. Respond with a JSON object containing:
+- "hypotheses": array of hypothesis statements
+- "tasks": array of analysis tasks (as originally requested)"""
+    else:
+        hypotheses_text = "\n".join(f"- {h}" for h in hypotheses)
+        hypotheses_section = f"Hypotheses to test:\n{hypotheses_text}"
 
     # Inject model selection context if available
     model_context = ""
@@ -223,7 +235,7 @@ If an ensemble_code_template is available in context, use it as the basis for th
     if _needs_web_search(state["user_objective"]):
         web_results = _attempt_web_search(state["user_objective"], state.get("session_id", "default"))
         state["web_results"] = web_results
-        
+
         if not web_results:
             web_note = "\n[Note: web search was requested but unavailable — plan based on data only]\n"
         else:
@@ -236,8 +248,7 @@ Do NOT hallucinate or guess column names.
 
 Objective: {state['user_objective']}
 {web_note}
-Hypotheses to test:
-{hypotheses_text}
+{hypotheses_section}
 
 {model_context}
 Data available:
@@ -263,7 +274,18 @@ Respond ONLY with valid JSON array."""
 
     try:
         cleaned = _extract_json(response)
-        tasks = json.loads(cleaned)
+        result = json.loads(cleaned)
+        # Handle combined response with both hypotheses and tasks
+        if isinstance(result, dict):
+            if "hypotheses" in result:
+                state["hypotheses"] = [h.get("statement", str(h)) for h in result["hypotheses"]]
+                logger.info(f"[Planner] Generated {len(state['hypotheses'])} hypotheses")
+            if "tasks" in result:
+                tasks = result["tasks"]
+            else:
+                tasks = result.get("analysis_plan", result.get("plan", []))
+        else:
+            tasks = result
         state["analysis_plan"] = tasks
         state["current_step"] = 0
         logger.info(f"[Planner] Created plan with {len(tasks)} tasks")
@@ -363,9 +385,9 @@ def run_planner(
         except Exception as e:
             logger.error(f"[Planner] Graph execution failed: {e}")
 
-    # Fallback: run nodes sequentially
+    # Fallback: run nodes sequentially (skip generate_hypotheses -
+    # folded into decompose_into_tasks to halve LLM calls)
     state = initial_state
-    state = generate_hypotheses(state)
     state = decompose_into_tasks(state)
     state = create_final_plan(state)
     state = store_plan_to_memory(state)

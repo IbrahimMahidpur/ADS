@@ -82,7 +82,7 @@ def _call_ollama(prompt: str, system: str = "", max_tokens: int = 4000) -> str:
                 "stream": False,
                 "options": {"num_predict": max_tokens, "temperature": 0.1},
             },
-            timeout=LLM_TIMEOUT,
+            timeout=httpx.Timeout(connect=5.0, read=LLM_TIMEOUT, write=LLM_TIMEOUT, pool=5.0),
         )
         if response.status_code == 200:
             resp_json = response.json()
