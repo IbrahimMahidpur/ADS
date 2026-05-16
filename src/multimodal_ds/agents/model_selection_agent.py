@@ -446,20 +446,65 @@ class ModelSelectionAgent:
 
     def tune_all_models(self, X, y, selection: Dict[str, Any], n_trials: int = 30) -> Dict[str, Any]:
         """Tune primary and ensemble models and store results in the context pool.
-
+ 
+        X and y should arrive already encoded (primary encoding is in graph.py
+        _model_selection_node). This method applies a safety-net re-encode in
+        case it is called directly (e.g. from tests or the API endpoint).
+ 
         Returns a dict mapping model name to its tuning result.
         """
+        import pandas as _pd
+        from sklearn.preprocessing import LabelEncoder as _LE
+ 
+        # ── Safety-net encoding ───────────────────────────────────────────────
+        # Primary encoding happens in _model_selection_node before this is
+        # called. This block defends against direct calls (tests, API, etc.)
+        # that skip that node.
+ 
+        # Encode target if strings arrived
+        if y is not None and hasattr(y, "dtype"):
+            if _pd.api.types.is_string_dtype(y) or _pd.api.types.is_object_dtype(y):
+                _le_y = _LE()
+                y = _pd.Series(
+                    _le_y.fit_transform(y.astype(str)),
+                    name=getattr(y, "name", "target"),
+                )
+                logger.info(
+                    f"[ModelSelection/tune] Safety-net encoded target: "
+                    f"{dict(zip(_le_y.classes_, _le_y.transform(_le_y.classes_)))}"
+                )
+                self.pool.set(
+                    "target_label_mapping",
+                    {str(cls): int(i) for i, cls in enumerate(_le_y.classes_)},
+                    agent="model_selection_agent",
+                )
+ 
+        # Encode categorical feature columns if they slipped through
+        if hasattr(X, "columns"):
+            _cat_cols = [
+                c for c in X.columns
+                if _pd.api.types.is_string_dtype(X[c]) or _pd.api.types.is_object_dtype(X[c])
+            ]
+            if _cat_cols:
+                logger.info(f"[ModelSelection/tune] Safety-net encoding features: {_cat_cols}")
+                X = X.copy()
+                _le_f = _LE()
+                for _col in _cat_cols:
+                    X[_col] = _le_f.fit_transform(X[_col].astype(str))
+        # ── End safety-net ────────────────────────────────────────────────────
+ 
         # Drop ID-like columns that can't be used as features
         id_patterns = ['id', 'customer', 'cust_', 'surname', 'name', 'ID']
-        cols_to_drop = [c for c in (X.columns.tolist() if hasattr(X, 'columns') else [])
-                       if any(p.lower() in c.lower() for p in id_patterns)]
-        if cols_to_drop:
-            logger.info(f"[ModelSelection] Dropping ID-like columns: {cols_to_drop}")
-            X = X.drop(columns=cols_to_drop)
-
+        if hasattr(X, 'columns'):
+            cols_to_drop = [c for c in X.columns.tolist()
+                            if any(p.lower() in c.lower() for p in id_patterns)]
+            if cols_to_drop:
+                logger.info(f"[ModelSelection] Dropping ID-like columns: {cols_to_drop}")
+                X = X.drop(columns=cols_to_drop)
+ 
         tuning_results = {}
         models_to_tune = selection.get("recommended_models", [])
-
+ 
         # Guard: if no models or no target, return meaningful fallback
         if not models_to_tune or y is None:
             logger.warning("[ModelSelection] No models to tune or target missing")
@@ -469,7 +514,7 @@ class ModelSelectionAgent:
                 "_skipped": True,
                 "_reason": "no_models_or_no_target"
             }
-
+ 
         # Check if optuna is available
         global optuna
         if optuna is None:
@@ -483,7 +528,7 @@ class ModelSelectionAgent:
                     "_skipped": True,
                     "_reason": "optuna_not_installed"
                 }
-
+ 
         # Define simple default search spaces mirroring previous static grids
         default_spaces = {
             "RandomForestClassifier": {"n_estimators": {"type": "int", "low": 50, "high": 300}, "max_depth": {"type": "int", "low": 5, "high": 30}},
@@ -493,20 +538,20 @@ class ModelSelectionAgent:
             "Ridge": {"alpha": {"type": "float", "low": 0.1, "high": 100.0}},
             "GradientBoostingRegressor": {"n_estimators": {"type": "int", "low": 50, "high": 300}, "learning_rate": {"type": "float", "low": 0.01, "high": 0.2}, "max_depth": {"type": "int", "low": 3, "high": 10}},
         }
-
+ 
         from multimodal_ds.agents.model_agents import get_model_agent
-        
+ 
         target_col = y.name if hasattr(y, 'name') and y.name else "target"
         feature_cols = X.columns.tolist() if hasattr(X, 'columns') else []
         task_type = "classification" if "Classifier" in selection.get("primary_model", "") else "regression"
-
+ 
         for mdl in models_to_tune:
             space = default_spaces.get(mdl, {})
             if not space:
                 continue
             result = self.tune_model(mdl, X, y, selection.get("cv_strategy", "kfold"), selection.get("scoring_metric", "r2"), space, n_trials=n_trials)
             tuning_results[mdl] = result
-            
+ 
             # Generate model-specific training code
             model_agent = get_model_agent(mdl, self.session_id)
             code = model_agent.generate_training_code(
@@ -516,7 +561,7 @@ class ModelSelectionAgent:
                 best_params=result.get("best_params", {}),
             )
             tuning_results[mdl]["generated_code"] = code
-
+ 
         # Determine best overall model
         best_overall_model = None
         best_overall_score = float('-inf')
@@ -525,14 +570,14 @@ class ModelSelectionAgent:
             if val is not None and val > best_overall_score:
                 best_overall_score = val
                 best_overall_model = mdl
-        # Store summary in results
+ 
         tuning_results['best_overall_model'] = best_overall_model
         tuning_results['best_overall_score'] = best_overall_score
-
+ 
         # Persist results in SharedContextPool
         self.pool.set("tuning_results", tuning_results, agent="model_selection_agent")
         self.pool.set("best_model", best_overall_model, agent="model_selection_agent")
-
+ 
         # Broadcast STATS_COMPLETE via MessageBus
         from multimodal_ds.core.message_bus import AgentMessage, MessageType, get_bus
         bus = get_bus()
@@ -543,10 +588,10 @@ class ModelSelectionAgent:
             payload={
                 "best_model": best_overall_model,
                 "best_score": best_overall_score,
-                "models_tuned": len(tuning_results) - 2  # Excluding the summary keys
+                "models_tuned": len(tuning_results) - 2  # Excluding summary keys
             }
         ))
-
+ 
         return tuning_results
 
     def generate_tuned_ensemble_code(
