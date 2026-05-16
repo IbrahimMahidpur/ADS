@@ -244,8 +244,9 @@ def _model_selection_node(state):
     """Select and configure models based on statistical report and AutoML suggestion."""
     import pandas as pd
     from pathlib import Path
+    from sklearn.preprocessing import LabelEncoder
     from multimodal_ds.agents.model_selection_agent import ModelSelectionAgent
-
+ 
     try:
         tab_summaries = state.get("tabular_summaries", [])
         if not tab_summaries:
@@ -256,7 +257,7 @@ def _model_selection_node(state):
         if not file_path:
             logger.info("[ModelSelection] Tabular summary missing source – skipping.")
             return {}
-
+ 
         # Load dataframe based on extension
         df = None
         p = Path(file_path)
@@ -266,24 +267,53 @@ def _model_selection_node(state):
             df = pd.read_excel(file_path)
         elif p.suffix.lower() == ".parquet":
             df = pd.read_parquet(file_path)
-
+ 
         if df is None:
             logger.warning(f"[ModelSelection] Unsupported file extension for {file_path}")
             return {}
-
+ 
         automl_suggestion = first.get("automl_suggestion", {})
         candidates = automl_suggestion.get("target_candidates", [])
         target_col = candidates[0] if candidates else df.columns[-1]
         stat_report = state.get("statistical_report", {})
-
+ 
+        # ── FIX: Encode target + categoricals before ANY sklearn/Optuna call ──
+        # Without this, string targets like 'Yes'/'No' cause:
+        #   ValueError: Invalid classes inferred from unique values of `y`.
+        #   Expected: [0 1], got ['No' 'Yes']
+        #
+        # Uses pd.api.types.is_string_dtype() which works correctly across
+        # pandas 1.x / 2.x / 3.x (StringDtype + object dtype both covered).
+ 
+        # 1. Encode the target column if it contains strings
+        if target_col and target_col in df.columns:
+            if pd.api.types.is_string_dtype(df[target_col]) or pd.api.types.is_object_dtype(df[target_col]):
+                le_target = LabelEncoder()
+                df[target_col] = le_target.fit_transform(df[target_col].astype(str))
+                label_map = {str(cls): int(i) for i, cls in enumerate(le_target.classes_)}
+                logger.info(f"[ModelSelection] Encoded target '{target_col}': {label_map}")
+ 
+        # 2. Encode remaining categorical feature columns (string/object, not target)
+        cat_feat_cols = [
+            c for c in df.columns
+            if c != target_col
+            and (pd.api.types.is_string_dtype(df[c]) or pd.api.types.is_object_dtype(df[c]))
+        ]
+        if cat_feat_cols:
+            logger.info(f"[ModelSelection] Encoding categorical features: {cat_feat_cols}")
+            le_feat = LabelEncoder()
+            for col in cat_feat_cols:
+                df[col] = le_feat.fit_transform(df[col].astype(str))
+        # ── END FIX ────────────────────────────────────────────────────────────
+ 
         agent = ModelSelectionAgent(session_id=state.get("session_id", "default"))
         result = agent.select_models(df, target_col, stat_report, automl_suggestion)
+ 
         # Determine dataset size for optional tuning
         shape = first.get("shape", [0, 0])
         n_rows = shape[0] if isinstance(shape, (list, tuple)) and len(shape) > 0 else 0
-
+ 
         # Generate baseline ensemble code (large-dataset path, no Optuna).
-        # generate_ensemble_code is deterministic and does not call an LLM.
         try:
             tuned_code = agent.generate_ensemble_code(result, "df", target_col) or ""
             if not tuned_code:
@@ -293,20 +323,23 @@ def _model_selection_node(state):
                 f"[ModelSelection] Code generation skipped for large dataset: {_gen_err}"
             )
             tuned_code = ""
-
+ 
         tuning_results = {}
         if 0 < n_rows <= 50000:
             try:
                 logger.info(f"[ModelSelection] Starting Optuna tuning for {n_rows} rows...")
-                # Prepare X and y for tuning
+                # X and y come from the already-encoded df — no re-encoding needed here
                 X = df.drop(columns=[target_col]) if target_col and target_col in df.columns else df
                 y = df[target_col] if target_col and target_col in df.columns else None
+ 
                 # Drop ID-like columns that can't be used as features
                 id_patterns = ['id', 'customer', 'cust_', 'surname', 'name', 'ID']
-                cols_to_drop = [c for c in X.columns.tolist() if any(p.lower() in c.lower() for p in id_patterns)]
+                cols_to_drop = [c for c in X.columns.tolist()
+                                if any(p.lower() in c.lower() for p in id_patterns)]
                 if cols_to_drop:
                     logger.info(f"[ModelSelection] Dropping ID-like columns: {cols_to_drop}")
                     X = X.drop(columns=cols_to_drop)
+ 
                 if y is not None:
                     tuning_results = agent.tune_all_models(X, y, result)
                     tuned_code = agent.generate_tuned_ensemble_code(result, tuning_results, "df", target_col)
@@ -317,7 +350,7 @@ def _model_selection_node(state):
                 logger.warning(f"[ModelSelection] Optuna tuning failed: {e} - using default ensemble code")
         else:
             logger.info(f"[ModelSelection] Skipping tuning (n_rows={n_rows})")
-
+ 
         return {"model_selection": result, "tuning_results": tuning_results, "ensemble_code_template": tuned_code}
     except Exception as e:
         logger.warning(f"[ModelSelection] Node error: {e}")
@@ -890,7 +923,17 @@ def _reporter_node(state):
 # ── Quality gate node ────────────────────────────────────────────────────────
 
 def _quality_gate_node(state):
-    """Fast rule‑based quality gate between executor and reviewer."""
+    """Fast rule-based quality gate between executor and reviewer.
+
+    FIX (double-append bug): The original implementation read
+    `new_errors = state.get("errors", [])` then returned the full accumulated
+    list. Because the `errors` field in AgentState uses `operator.add` as its
+    LangGraph reducer, each gate call was re-appending ALL prior errors,
+    causing exponential duplication across steps.
+
+    Correct behaviour: return ONLY the new error strings produced by THIS
+    gate invocation (empty list on pass). LangGraph's reducer appends them.
+    """
     # Last execution info
     outputs = state.get("full_code_outputs", [])
     last_output = outputs[-1] if outputs else ""
@@ -901,30 +944,38 @@ def _quality_gate_node(state):
     task_name = "unknown"
     if current_step > 0 and tasks:
         task_name = tasks[current_step - 1].get("name", "unknown")
+
     # Rule checks
     gate_passed = True
     gate_reasons = []
-    # 1. OS‑level success
+
+    # 1. OS-level success
     if not last_success:
         gate_passed = False
         gate_reasons.append("Execution returned non-zero exit code")
-    # 2. Output length - lowered from 20 to 5 since short output like
-    # print(df.head()) on failed import isn't a crash
+
+    # 2. Output length — must be at least 5 chars to be meaningful
     if len(last_output.strip()) < 5:
         gate_passed = False
         gate_reasons.append("Output too short - likely crashed silently")
-    # 3. Expected artifact files for modeling/evaluation
+
+    # 3. Expected artifact files for modeling/evaluation tasks
     task_type = tasks[current_step - 1].get("type", "") if current_step > 0 and tasks else ""
     if task_type in ("modeling", "evaluation"):
         if not any(f.endswith((".pkl", ".joblib", ".csv", ".txt")) for f in last_files):
             gate_passed = False
             gate_reasons.append(f"Modeling task produced no artifact files: {last_files}")
-    # 4. Python error indicators
-    error_indicators = ["Traceback (most recent", "Error:", "Exception:", "ModuleNotFoundError", "KeyError:", "AttributeError:"]
+
+    # 4. Python error indicators — only fail if no recovery files were produced
+    error_indicators = [
+        "Traceback (most recent", "Error:", "Exception:",
+        "ModuleNotFoundError", "KeyError:", "AttributeError:",
+    ]
     if any(ind in last_output for ind in error_indicators) and not last_files:
         gate_passed = False
         gate_reasons.append("Output contains Python errors with no recovery files")
-    # 5. Hallucination guard – column names
+
+    # 5. Hallucination guard — column names referenced in code vs actual columns
     if state.get("tabular_summaries"):
         actual_cols = set(state["tabular_summaries"][0].get("columns", []))
         import re
@@ -934,21 +985,24 @@ def _quality_gate_node(state):
         if phantom_cols and len(phantom_cols) > 2:
             gate_passed = False
             gate_reasons.append(f"Hallucinated column names: {phantom_cols}")
+
     # Logging
     if gate_passed:
         logger.info(f"[QualityGate] Step {current_step} '{task_name}': PASSED")
     else:
         logger.warning(f"[QualityGate] Step {current_step} '{task_name}': FAILED - {gate_reasons}")
-    # Update errors list
-    new_errors = state.get("errors", [])
-    if not gate_passed:
-        new_errors = new_errors + [f"Quality gate failed: {r}" for r in gate_reasons]
+
+    # ── FIX: return ONLY new errors ───────────────────────────────────────────
+    # DO NOT read or return state["errors"] here.
+    # The operator.add reducer in AgentState accumulates lists automatically.
+    # Returning the existing list would cause every prior error to be appended again.
+    new_errors = [f"Quality gate failed: {r}" for r in gate_reasons] if not gate_passed else []
+
     return {
         "gate_passed": gate_passed,
         "gate_reasons": gate_reasons,
-        "errors": new_errors,
+        "errors": new_errors,   # ← only NEW errors; reducer handles accumulation
     }
-
 
 # ── Conditional edges ────────────────────────────────────────────────────────
 

@@ -12,8 +12,9 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, List, Literal
 
-from multimodal_ds.config import PLANNER_MODEL, OLLAMA_BASE_URL, LLM_TIMEOUT
+from multimodal_ds.config import PLANNER_MODEL, LLM_TIMEOUT
 from multimodal_ds.core.schema import UnifiedDocument, DataType
+from multimodal_ds.core.llm_client import chat_with_fallback
 from multimodal_ds.core.context_pool import get_context_pool
 from multimodal_ds.core.message_bus import AgentMessage, MessageType, get_bus
 
@@ -63,33 +64,24 @@ def _extract_json(text: str) -> str:
 
 
 def _call_ollama(prompt: str, system: str = "", max_tokens: int = 4000) -> str:
-    """Call Ollama's chat endpoint using the planner model.
+    """Call LLM via unified client using the planner model.
 
-    Returns the raw ``content`` string from the response, or an error placeholder.
+    Returns the raw content string from the response, or an error placeholder.
     """
-    import httpx
-    model = PLANNER_MODEL.replace("ollama/", "")
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
     try:
-        messages = []
-        if system:
-            messages.append({"role": "system", "content": system})
-        messages.append({"role": "user", "content": prompt})
-        response = httpx.post(
-            f"{OLLAMA_BASE_URL}/api/chat",
-            json={
-                "model": model,
-                "messages": messages,
-                "stream": False,
-                "options": {"num_predict": max_tokens, "temperature": 0.1},
-            },
-            timeout=httpx.Timeout(connect=5.0, read=LLM_TIMEOUT, write=LLM_TIMEOUT, pool=5.0),
+        return chat_with_fallback(
+            primary_model=PLANNER_MODEL,
+            fallback_model="ollama/qwen2.5:7b",
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=0.1,
         )
-        if response.status_code == 200:
-            resp_json = response.json()
-            if isinstance(resp_json, dict):
-                return resp_json.get("message", {}).get("content", "")
-            return str(resp_json)
-        return f"[Error: HTTP {response.status_code}]"
+    except Exception as e:
+        return f"[Error: {e}]"
     except Exception as e:
         return f"[Error: {e}]"
 
