@@ -67,9 +67,10 @@ def _attempt_web_search(objective: str, session_id: str = "default") -> str:
 import operator
 import httpx
 
-from multimodal_ds.config import HYPOTHESIS_MODEL, PLANNER_MODEL, OLLAMA_BASE_URL, LLM_TIMEOUT, PLANNER_TIMEOUT
+from multimodal_ds.config import HYPOTHESIS_MODEL, PLANNER_MODEL, LLM_TIMEOUT, PLANNER_TIMEOUT
 from multimodal_ds.memory.agent_memory import AgentMemory
 from multimodal_ds.core.schema import UnifiedDocument
+from multimodal_ds.core.llm_client import chat_with_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -131,29 +132,18 @@ class PlannerState(TypedDict):
 
 
 def _call_ollama(prompt: str, system: str = "", max_tokens: int = 4000, timeout: int = None) -> str:
-    """Call Ollama with a prompt and return response text."""
-    import httpx
-    model = PLANNER_MODEL.replace("ollama/", "")
-    read_timeout = timeout if timeout is not None else PLANNER_TIMEOUT
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
     try:
-        messages = []
-        if system:
-            messages.append({"role": "system", "content": system})
-        messages.append({"role": "user", "content": prompt})
-
-        response = httpx.post(
-            f"{OLLAMA_BASE_URL}/api/chat",
-            json={
-                "model": model,
-                "messages": messages,
-                "stream": False,
-                "options": {"num_predict": max_tokens, "temperature": 0.3},
-            },
-            timeout=httpx.Timeout(connect=5.0, read=read_timeout, write=read_timeout, pool=5.0),
+        return chat_with_fallback(
+            primary_model=PLANNER_MODEL,
+            fallback_model="ollama/qwen2.5:7b",
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=0.3,
         )
-        if response.status_code == 200:
-            return response.json().get("message", {}).get("content", "")
-        return f"[Error: HTTP {response.status_code}]"
     except Exception as e:
         return f"[Error: {e}]"
 

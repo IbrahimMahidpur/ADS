@@ -449,6 +449,14 @@ class ModelSelectionAgent:
 
         Returns a dict mapping model name to its tuning result.
         """
+        # Drop ID-like columns that can't be used as features
+        id_patterns = ['id', 'customer', 'cust_', 'surname', 'name', 'ID']
+        cols_to_drop = [c for c in (X.columns.tolist() if hasattr(X, 'columns') else [])
+                       if any(p.lower() in c.lower() for p in id_patterns)]
+        if cols_to_drop:
+            logger.info(f"[ModelSelection] Dropping ID-like columns: {cols_to_drop}")
+            X = X.drop(columns=cols_to_drop)
+
         tuning_results = {}
         models_to_tune = selection.get("recommended_models", [])
 

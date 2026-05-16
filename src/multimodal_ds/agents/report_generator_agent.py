@@ -31,10 +31,10 @@ import httpx
 
 from multimodal_ds.config import (
     LLM_TIMEOUT,
-    OLLAMA_BASE_URL,
     OUTPUT_DIR,
     REVIEWER_MODEL,
 )
+from multimodal_ds.core.llm_client import chat_with_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -305,30 +305,18 @@ class ReportGeneratorAgent:
         Never raises.
         """
         try:
-            resp = httpx.post(
-                f"{OLLAMA_BASE_URL}/api/chat",
-                json={
-                    "model": self._model,
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {"role": "user",   "content": prompt},
-                    ],
-                    "stream": False,
-                    "options": {"num_predict": 2000, "temperature": 0.2},
-                },
-                timeout=httpx.Timeout(connect=5.0, read=LLM_TIMEOUT, write=LLM_TIMEOUT, pool=5.0),
+            content = chat_with_fallback(
+                primary_model=self._model,
+                fallback_model="ollama/qwen2.5:7b",
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=2000,
+                temperature=0.2,
             )
-            if resp.status_code == 200:
-                content = resp.json().get("message", {}).get("content", "")
-                # Strip <think>…</think> reasoning traces
-                content = re.sub(
-                    r"<think>.*?</think>", "", content, flags=re.DOTALL
-                ).strip()
-                return content
-            logger.warning(
-                f"[ReportGenerator] Ollama HTTP {resp.status_code}"
-            )
-            return ""
+            content = re.sub(r"<think>.*?", "", content, flags=re.DOTALL).strip()
+            return content
         except Exception as exc:
             logger.warning(f"[ReportGenerator] LLM call failed: {exc}")
             return ""

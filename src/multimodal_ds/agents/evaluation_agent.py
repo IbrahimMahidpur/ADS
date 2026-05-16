@@ -24,8 +24,9 @@ from typing import Optional
 
 import httpx
 
-from multimodal_ds.config import REVIEWER_MODEL, OLLAMA_BASE_URL, LLM_TIMEOUT, OUTPUT_DIR
+from multimodal_ds.config import REVIEWER_MODEL, LLM_TIMEOUT, OUTPUT_DIR
 from multimodal_ds.memory.agent_memory import AgentMemory
+from multimodal_ds.core.llm_client import chat_with_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -339,24 +340,18 @@ Respond with ONLY this JSON structure (no markdown, no explanation):
   "recommendation":        "<one actionable sentence for the next step>"
 }}"""
 
-        model = REVIEWER_MODEL.replace("ollama/", "")
         try:
-            response = httpx.post(
-                f"{OLLAMA_BASE_URL}/api/chat",
-                json={
-                    "model": model,
-                    "messages": [
-                        {"role": "system", "content": self.JUDGE_SYSTEM_PROMPT},
-                        {"role": "user",   "content": prompt},
-                    ],
-                    "stream": False,
-                    "options": {"num_predict": 500, "temperature": 0.1},
-                },
-                timeout=httpx.Timeout(connect=5.0, read=LLM_TIMEOUT, write=LLM_TIMEOUT, pool=5.0),
+            content = chat_with_fallback(
+                primary_model=REVIEWER_MODEL,
+                fallback_model="ollama/qwen2.5:7b",
+                messages=[
+                    {"role": "system", "content": self.JUDGE_SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=500,
+                temperature=0.1,
             )
-            if response.status_code == 200:
-                content = response.json().get("message", {}).get("content", "").strip()
-                return self._parse_judge_response(content)
+            return self._parse_judge_response(content)
         except Exception as e:
             logger.warning(f"[EvalAgent] LLM judge call failed: {e}")
 

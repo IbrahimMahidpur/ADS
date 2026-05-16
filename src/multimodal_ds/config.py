@@ -24,16 +24,18 @@ for d in [DATA_DIR, OUTPUT_DIR, CHROMA_DIR, FAISS_DIR]:
 
 # Specialized model assignments (override with env vars)
 # Falls back to PLANNER_MODEL/CODER_MODEL if specialized model not pulled
-STATS_INTERPRETER_MODEL = os.getenv("STATS_MODEL", os.getenv("REVIEWER_MODEL", "ollama/mistral:7b"))
-CODE_GEN_MODEL = os.getenv("CODE_GEN_MODEL", os.getenv("CODER_MODEL", "ollama/deepseek-coder-v2:16b"))
-CODE_FIX_MODEL = os.getenv("CODE_FIX_MODEL", os.getenv("CODER_MODEL", "ollama/qwen2.5-coder:7b"))
-HYPOTHESIS_MODEL = os.getenv("HYPOTHESIS_MODEL", os.getenv("PLANNER_MODEL", "ollama/deepseek-r1:7b"))
+STATS_INTERPRETER_MODEL = os.getenv("STATS_INTERPRETER_MODEL", "ollama/qwen2.5:7b")
+CODE_GEN_MODEL = os.getenv("CODE_GEN_MODEL", "opencode/minimax-m2.5-free")
+CODE_FIX_MODEL = os.getenv("CODE_FIX_MODEL", "ollama/qwen2.5-coder:7b")
+HYPOTHESIS_MODEL = os.getenv("HYPOTHESIS_MODEL", "opencode/minimax-m2.5-free")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "ollama/mxbai-embed-large")
 
+OPENCODE_ZEN_API_KEY = os.getenv("OPENCODE_ZEN_API_KEY", "")
+
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-PLANNER_MODEL   = os.getenv("PLANNER_MODEL",  "ollama/qwen2.5:7b")
-CODER_MODEL     = os.getenv("CODER_MODEL",    "ollama/qwen2.5:7b")
-REVIEWER_MODEL  = os.getenv("REVIEWER_MODEL", "ollama/qwen2.5:7b")
+PLANNER_MODEL   = os.getenv("PLANNER_MODEL",  "opencode/minimax-m2.5-free")
+CODER_MODEL     = os.getenv("CODER_MODEL",    "opencode/minimax-m2.5-free")
+REVIEWER_MODEL  = os.getenv("REVIEWER_MODEL", "opencode/minimax-m2.5-free")
 VISION_MODEL    = os.getenv("VISION_MODEL",   "ollama/llava:7b")
 MAX_ITERATIONS = int(os.getenv("MAX_ITERATIONS", "10"))
 LLM_TIMEOUT    = int(os.getenv("LLM_TIMEOUT",    "60"))

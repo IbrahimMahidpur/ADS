@@ -13,8 +13,9 @@ from typing import Optional
 
 import httpx
 
-from multimodal_ds.config import CODE_GEN_MODEL, CODE_FIX_MODEL, OLLAMA_BASE_URL, LLM_TIMEOUT, OUTPUT_DIR
+from multimodal_ds.config import CODE_GEN_MODEL, CODE_FIX_MODEL, LLM_TIMEOUT, OUTPUT_DIR
 from multimodal_ds.memory.agent_memory import AgentMemory
+from multimodal_ds.core.llm_client import chat_with_fallback
 from multimodal_ds.core.observability import agent_span, get_session_tracker
 
 logger = logging.getLogger(__name__)
@@ -175,7 +176,6 @@ class CodeExecutionAgent:
         * cross‑session lessons via the ReflectionAgent.
         The LLM is then called and the extracted code is returned.
         """
-        import httpx
         # Build constraints list and inject Optuna tuning info if available
         constraints: list = []
         constraints = self._inject_statistical_constraints(constraints)
@@ -193,16 +193,18 @@ class CodeExecutionAgent:
                     logger.info(f"[CodeAgent] Injected {len(lesson_results)} past lessons into prompt")
         except Exception as e:
             logger.debug(f"[CodeAgent] Lesson retrieval skipped: {e}")
-        model = CODE_GEN_MODEL.replace("ollama/", "")
         try:
-            response = httpx.post(
-                f"{OLLAMA_BASE_URL}/api/chat",
-                json={"model": model, "messages": [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": prompt}], "stream": False, "options": {"num_predict": 4000, "temperature": 0.1}},
-                timeout=httpx.Timeout(connect=5.0, read=LLM_TIMEOUT, write=LLM_TIMEOUT, pool=5.0),
+            content = chat_with_fallback(
+                primary_model=CODE_GEN_MODEL,
+                fallback_model="ollama/qwen2.5-coder:7b",
+                messages=[
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=4000,
+                temperature=0.1,
             )
-            if response.status_code == 200:
-                content = response.json().get("message", {}).get("content", "")
-                return self._extract_code(content)
+            return self._extract_code(content)
         except Exception as e:
             logger.error(f"[CodeAgent] Code generation failed: {e}")
         return ""
@@ -282,19 +284,21 @@ class CodeExecutionAgent:
         return {"success": False, "code": code, "output": output, "files_created": files, "error": output, "retries_used": max_retries}
 
     def _generate_fix(self, failed_code: str, error_output: str, task_desc: str) -> str:
-        import httpx
-        model = CODE_GEN_MODEL.replace("ollama/", "")
         prompt = f"""Fix this Python code that failed.\nTask: {task_desc}\nFailed code:\n```python\n{failed_code[:1500]}\n```\nError:\n{error_output[:500]}\nProvide ONE complete fixed Python script in ```python ... ``` fences."""
         try:
-            response = httpx.post(
-                f"{OLLAMA_BASE_URL}/api/chat",
-                json={"model": model, "messages": [{"role": "system", "content": "Fix Python code. Output only the fixed code in ```python``` fences."}, {"role": "user", "content": prompt}], "stream": False, "options": {"num_predict": 2000, "temperature": 0.1}},
-                timeout=httpx.Timeout(connect=5.0, read=LLM_TIMEOUT, write=LLM_TIMEOUT, pool=5.0),
+            content = chat_with_fallback(
+                primary_model=CODE_FIX_MODEL,
+                fallback_model="ollama/qwen2.5-coder:7b",
+                messages=[
+                    {"role": "system", "content": "Fix Python code. Output only the fixed code in ```python``` fences."},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=2000,
+                temperature=0.1,
             )
-            if response.status_code == 200:
-                return self._extract_code(response.json().get("message", {}).get("content", ""))
-        except Exception:
-            pass
+            return self._extract_code(content)
+        except Exception as e:
+            logger.error(f"[CodeAgent] Code fix failed: {e}")
         return ""
 
     def _extract_code(self, text: str) -> str:

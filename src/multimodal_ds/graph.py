@@ -301,6 +301,12 @@ def _model_selection_node(state):
                 # Prepare X and y for tuning
                 X = df.drop(columns=[target_col]) if target_col and target_col in df.columns else df
                 y = df[target_col] if target_col and target_col in df.columns else None
+                # Drop ID-like columns that can't be used as features
+                id_patterns = ['id', 'customer', 'cust_', 'surname', 'name', 'ID']
+                cols_to_drop = [c for c in X.columns.tolist() if any(p.lower() in c.lower() for p in id_patterns)]
+                if cols_to_drop:
+                    logger.info(f"[ModelSelection] Dropping ID-like columns: {cols_to_drop}")
+                    X = X.drop(columns=cols_to_drop)
                 if y is not None:
                     tuning_results = agent.tune_all_models(X, y, result)
                     tuned_code = agent.generate_tuned_ensemble_code(result, tuning_results, "df", target_col)

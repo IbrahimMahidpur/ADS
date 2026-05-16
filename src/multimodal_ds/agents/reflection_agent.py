@@ -33,10 +33,10 @@ import httpx
 
 from multimodal_ds.config import (
     LLM_TIMEOUT,
-    OLLAMA_BASE_URL,
     REVIEWER_MODEL,
 )
 from multimodal_ds.core.context_pool import get_context_pool
+from multimodal_ds.core.llm_client import chat_with_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -249,29 +249,18 @@ class ReflectionAgent:
         ``improved_instructions`` keys, or ``None`` on any failure.
         """
         prompt = _build_diagnosis_prompt(task_name, target_eval, worst_dim)
-        model  = REVIEWER_MODEL.replace("ollama/", "")
 
         try:
-            response = httpx.post(
-                f"{OLLAMA_BASE_URL}/api/chat",
-                json={
-                    "model":   model,
-                    "messages": [
-                        {"role": "system", "content": self._DIAGNOSIS_SYSTEM},
-                        {"role": "user",   "content": prompt},
-                    ],
-                    "stream":  False,
-                    "options": {"temperature": 0.1, "num_predict": 400},
-                },
-                timeout=httpx.Timeout(connect=5.0, read=LLM_TIMEOUT, write=LLM_TIMEOUT, pool=5.0),
+            content = chat_with_fallback(
+                primary_model=REVIEWER_MODEL,
+                fallback_model="ollama/deepseek-r1:7b",
+                messages=[
+                    {"role": "system", "content": self._DIAGNOSIS_SYSTEM},
+                    {"role": "user", "content": prompt},
+                ],
+                max_tokens=400,
+                temperature=0.1,
             )
-            if response.status_code != 200:
-                logger.warning(
-                    "[ReflectionAgent] LLM returned HTTP %d", response.status_code
-                )
-                return None
-
-            content = response.json().get("message", {}).get("content", "").strip()
             return _parse_diagnosis_response(content)
 
         except Exception as exc:

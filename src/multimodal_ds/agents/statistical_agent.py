@@ -7,8 +7,9 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from multimodal_ds.config import REVIEWER_MODEL, OLLAMA_BASE_URL, LLM_TIMEOUT
+from multimodal_ds.config import STATS_INTERPRETER_MODEL, LLM_TIMEOUT
 from multimodal_ds.memory.agent_memory import AgentMemory
+from multimodal_ds.core.llm_client import chat_with_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -218,8 +219,6 @@ class StatisticalReasoningAgent:
         return result
 
     def _interpret_findings(self, report: dict, shape: tuple) -> str:
-        import httpx
-
         findings_text = (
             f"Dataset shape: {shape}\n"
             f"Normality: {len([v for v in report['normality'].values() if isinstance(v, dict) and v.get('is_normal')])} "
@@ -229,23 +228,17 @@ class StatisticalReasoningAgent:
             f"Non-stationary columns: {len([v for v in report['stationarity'].values() if isinstance(v, dict) and not v.get('is_stationary', True)])}"
         )
 
-        model = REVIEWER_MODEL.replace("ollama/", "")
         try:
-            response = httpx.post(
-                f"{OLLAMA_BASE_URL}/api/chat",
-                json={
-                    "model":    model,
-                    "messages": [
-                        {"role": "system", "content": "You are a statistician. Interpret findings concisely in 3-4 sentences."},
-                        {"role": "user",   "content": f"Interpret these statistical findings:\n{findings_text}"},
-                    ],
-                    "stream":  False,
-                    "options": {"num_predict": 300, "temperature": 0.2},
-                },
-                timeout=60,
+            return chat_with_fallback(
+                primary_model=STATS_INTERPRETER_MODEL,
+                fallback_model="ollama/qwen2.5:7b",
+                messages=[
+                    {"role": "system", "content": "You are a statistician. Interpret findings concisely in 3-4 sentences."},
+                    {"role": "user", "content": f"Interpret these statistical findings:\n{findings_text}"},
+                ],
+                max_tokens=300,
+                temperature=0.2,
             )
-            if response.status_code == 200:
-                return response.json().get("message", {}).get("content", "")
         except Exception:
             pass
         return findings_text

@@ -63,11 +63,12 @@ services:
       - "8000:8000"
     environment:
       - OLLAMA_BASE_URL=http://ollama:11434
-      - PLANNER_MODEL=ollama/qwen2.5:7b
-      - CODER_MODEL=ollama/qwen2.5:7b
-      - REVIEWER_MODEL=ollama/qwen2.5:7b
+      - PLANNER_MODEL=opencode/minimax-m2.5-free
+      - CODER_MODEL=opencode/minimax-m2.5-free
+      - REVIEWER_MODEL=opencode/minimax-m2.5-free
       - VISION_MODEL=ollama/llava:7b
-      - EMBED_MODEL=ollama/nomic-embed-text
+      - EMBED_MODEL=ollama/mxbai-embed-large
+      - OPENCODE_ZEN_API_KEY=${OPENCODE_ZEN_API_KEY}
       - CHROMA_PERSIST_DIR=/app/data/chroma
       - FAISS_INDEX_DIR=/app/data/faiss
       - WORKING_DIR=/app/agentic_output
